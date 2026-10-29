@@ -1,0 +1,5 @@
+Emoji graphics: Twemoji 17.0.3
+Copyright 2019 Twitter, Inc and other contributors; 2024 onward jdecked and other contributors.
+Licensed under CC-BY 4.0: https://creativecommons.org/licenses/by/4.0/
+Source: https://github.com/jdecked/twemoji
+Changes: rasterised PNGs scaled down to 32 px and repacked for the Nintendo 3DS.

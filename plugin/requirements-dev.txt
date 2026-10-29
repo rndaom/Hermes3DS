@@ -1,0 +1,11 @@
+# Test dependencies for the plugin (`python -m pytest` in plugin/). Inside Hermes the gateway's own environment
+# already provides cryptography, Pillow, httpx and anydoc; these pins match what Hermes ships.
+pytest
+pytest-asyncio
+cryptography
+pillow
+httpx==0.28.1
+firecrawl-anydoc==0.2.4
+# Optional: `hermes 3ds pair` draws a QR code in the terminal when segno is installed. ffmpeg on PATH enables
+# the audio tests.
+segno

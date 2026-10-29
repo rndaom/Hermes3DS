@@ -1,0 +1,26 @@
+name: 3ds-platform
+label: Nintendo 3DS
+kind: platform
+version: 0.1.0
+description: >
+  Nintendo 3DS gateway adapter for Hermes Agent. Opens an encrypted TCP listener
+  (Noise IK) that the Hermes 3DS homebrew app connects to: streaming chat, tool
+  progress, approvals, clarify, sessions, models, skills and cron.
+author: Random
+optional_env:
+  - name: THREEDS_PORT
+    description: "TCP port the 3DS connects to (default 7333)"
+    prompt: "3DS listener port"
+    password: false
+  - name: THREEDS_HOME_CHANNEL
+    description: "Chat id (dev:<fingerprint>) for cron delivery; see `hermes 3ds devices`"
+    prompt: "3DS home chat id"
+    password: false
+  - name: THREEDS_AWAY
+    description: "Away-from-home access: auto (Tailscale Funnel when Tailscale is installed), on, off"
+    prompt: "3DS away-from-home access (auto/on/off)"
+    password: false
+  - name: THREEDS_AWAY_PORT
+    description: "Loopback port the Tailscale Funnel forwards to (default 7339)"
+    prompt: "3DS away listener port"
+    password: false
