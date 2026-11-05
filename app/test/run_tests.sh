@@ -1,6 +1,6 @@
 #!/bin/sh
-# Host-side tests for the portable C code (Noise IK + codecs, blob cache pruning, camera YUV). Needs python and clang
-# (or set CC=gcc).
+# Host-side tests for the portable C code (Noise IK + codecs, blob cache pruning, camera YUV, DSP firmware search).
+# Needs python and clang (or set CC=gcc).
 set -e
 cd "$(dirname "$0")"
 CC="${CC:-clang}"
@@ -42,6 +42,11 @@ fi
 # The UI sounds (lyre plucks).
 OUT="$TMP/h3ds_test_tones.exe"
 "$CC" -std=c99 -O2 -Wall -Wextra -Werror -D_CRT_SECURE_NO_WARNINGS test_tones.c ../source/tones.c $LIBM -o "$OUT"
+"$OUT"
+
+# The DSP firmware inside the HOME Menu's .code (unpacking and the checks; nothing of Nintendo's needed).
+OUT="$TMP/h3ds_test_dspfirm.exe"
+"$CC" -std=c99 -O2 -Wall -Wextra -Werror -D_CRT_SECURE_NO_WARNINGS test_dspfirm.c ../source/dspfirm.c -o "$OUT"
 "$OUT"
 
 # IMA-ADPCM decoding (audio attachments) against ffmpeg's decoder, when ffmpeg is installed.

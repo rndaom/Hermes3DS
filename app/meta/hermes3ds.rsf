@@ -32,6 +32,7 @@ AccessControlInfo:
   FileSystemAccess:
    - DirectSdmc
    - DirectSdmcWrite
+   - CategoryFileSystemTool     # read the HOME Menu's .code (title archive 0x2345678A) for the DSP firmware
 
   MemoryType                    : Application
   SystemMode                    : 64MB         # Old 3DS default: the app budgets for ~32 MB

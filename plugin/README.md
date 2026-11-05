@@ -56,6 +56,9 @@ Read this before installing.
   answers discovery broadcasts from the 3DS on the same network. When a 3DS asks for it, the plugin may also
   connect back to that console's private (LAN) address. Only consoles you paired can open a session; pairing
   needs a one-time code and is accepted from the local network only.
+- **A development-only plaintext mode, off unless you set it.** `security: plaintext` in the platform's config
+  turns off encryption and pairing, so any device on your network could connect and chat with Hermes, approval
+  answers included. It exists for testing with `tools/fake3ds.py`; leave it at the default (`secure`).
 - **Away from home (Tailscale Funnel), off by default.** After you run `hermes 3ds away on` (or set
   `away: on`), and with Tailscale installed and signed in, the plugin asks Tailscale to publish a Funnel: a
   public internet address that forwards to a loopback-only listener on port 7339. Only paired consoles get past

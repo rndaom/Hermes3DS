@@ -2,11 +2,13 @@
 
 #include <3ds.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "adpcm.h"
 #include "app.h"
 #include "blob.h"
+#include "dspdump.h"
 #include "log.h"
 
 #define CH 0
@@ -14,10 +16,12 @@
 #define BUF_SAMPLES 4096    // ...of this many samples each: ~1.5 s at 22050 Hz, so slow frames don't gap it
 #define MAX_BLOCK 4096      // biggest IMA-ADPCM block accepted (the PC sends 1024)
 #define MAX_SPB ((MAX_BLOCK - 4) * 2 + 1)
+#define DSP_FIRM_MISSING 0xD880A7FA  // ndspInit: no sdmc:/3ds/dspfirm.cdc
 
 static struct {
     bool ndsp_tried, ndsp_ok;
     int16_t *mem;  // NBUF * BUF_SAMPLES samples in linear memory, for the DSP
+    void *firm;    // the DSP firmware copied from the HOME Menu (dspdump.c), handed to ndsp until ndspExit
     ndspWaveBuf wb[NBUF];
     uint32_t wb_start[NBUF], wb_seq[NBUF], seq;
 
@@ -52,6 +56,15 @@ bool audio_playable(const json_t *a)
            rate <= 48000 && block >= 8 && block <= MAX_BLOCK;
 }
 
+// Free the copied firmware and point ndsp back at the SD file, so it never keeps the freed pointer.
+static void drop_firm(void)
+{
+    if (!au.firm) return;
+    ndspUseComponent(NULL, 0, 0xFF, 0xFF);
+    free(au.firm);
+    au.firm = NULL;
+}
+
 bool audio_dsp_ready(void)
 {
     if (au.ndsp_tried) return au.ndsp_ok;
@@ -62,8 +75,21 @@ bool audio_dsp_ready(void)
         return false;
     }
     Result rc = ndspInit();
-    if (R_FAILED(rc)) {  // no DSP firmware dump (sdmc:/3ds/dspfirm.cdc)
+    if ((uint32_t)rc == DSP_FIRM_MISSING) {  // never dumped: copy it from the HOME Menu, then try again
+        uint32_t n;
+        if ((au.firm = dspdump_extract(&n))) {
+            ndspUseComponent(au.firm, n, 0xFF, 0xFF);
+            rc = ndspInit();
+            if (R_SUCCEEDED(rc)) {
+                dspdump_save(au.firm, n);  // only once the DSP took it, so a bad copy never sticks on the SD card
+                if (osGetTime() >= app.toast_until)  // the first sound often follows a toast: keep that one
+                    app_toast("Sound is set up: DSP firmware copied from the HOME Menu");
+            }
+        }
+    }
+    if (R_FAILED(rc)) {
         log_printf("audio: ndspInit failed %08lX", (unsigned long)rc);
+        drop_firm();
         linearFree(au.mem);
         au.mem = NULL;
         return false;
@@ -304,6 +330,7 @@ void audio_exit(void)
 {
     unload();
     if (au.ndsp_ok) ndspExit();
+    drop_firm();  // after ndspExit: ndsp doesn't free a component it was handed
     if (au.mem) linearFree(au.mem);
     memset(&au, 0, sizeof au);
 }

@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.1.2 (2026-11-05)
+
+App only; the plugin is unchanged (0.1.0).
+
+- Sound without dumping the DSP firmware: when `sdmc:/3ds/dspfirm.cdc` is missing, the app copies the firmware from
+  the console's own HOME Menu the first time it starts sound (about half a second, once) and saves it for next time.
+  Dumping it in Rosalina still works and is the fallback.
+- README: a QR code that installs the latest `.cia` with FBI (Remote Install, Scan QR Code).
+- Plugin README: discloses the development-only `security: plaintext` mode.
+
 ## 0.1.1 (2026-11-05)
 
 App only; the plugin is unchanged (0.1.0).

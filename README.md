@@ -71,8 +71,10 @@ Tailscale Funnel ([away from home](#away-from-home)). Either way the connection 
 
 - A **Nintendo 3DS / 2DS** (Old or New) with custom firmware (Luma3DS) and the Homebrew Launcher. It was built
   and tested on an Old 3DS.
-- For sounds, audio and spoken replies: the DSP firmware dump at `sdmc:/3ds/dspfirm.cdc` (Rosalina menu:
-  L + Down + Select → Miscellaneous options → Dump DSP firmware). Everything else works without it.
+- Sounds, audio and spoken replies need the console's DSP firmware at `sdmc:/3ds/dspfirm.cdc`. Hermes 3DS copies it
+  from your own HOME Menu the first time it plays a sound, so there's normally nothing to do. If that fails, dump it
+  yourself (Rosalina menu: L + Down + Select → Miscellaneous options → Dump DSP firmware). Everything else works
+  without it.
 - A computer running **Hermes Agent 0.22.5 or newer** with its gateway running (`hermes gateway run`, or `hermes gateway install` to run it as a service).
 - Wi-Fi the 3DS can join: **WPA2** (not WPA3-only), 2.4 GHz, no sign-in page. A phone hotspot works well.
 - Optional: `ffmpeg` on the computer for audio and voice replies; Tailscale for use away from home.
@@ -106,7 +108,13 @@ computer). If your firewall blocks them, allow both from your home network.
 Download `hermes3ds.3dsx` from the [latest release](https://github.com/rndaom/Hermes3DS/releases/latest),
 copy it to `sdmc:/3ds/` on the SD card, and start it from the Homebrew Launcher.
 
-Or install `hermes3ds.cia` with [FBI](https://github.com/nh-server/FBI-NH/releases) to get a HOME Menu icon.
+Or install `hermes3ds.cia` with [FBI](https://github.com/nh-server/FBI-NH/releases) to get a HOME Menu icon. The
+quickest way: in FBI, choose **Remote Install → Scan QR Code** and point the 3DS camera at this code. It always
+fetches the CIA from the latest release.
+
+<p align="center">
+  <img src="docs/media/install-qr.png" width="240" alt="QR code linking to hermes3ds.cia in the latest release">
+</p>
 
 ### 3. Pair them (once, at home)
 

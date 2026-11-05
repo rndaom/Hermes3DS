@@ -26,7 +26,8 @@ const char *audio_current(void);       // the current track's audio blob id, or 
 bool audio_animating(void);            // playing: redraw for the progress
 void audio_tick(void);                 // once a frame: refill the buffers
 void audio_exit(void);
-// ndsp started (on first use; false without sdmc:/3ds/dspfirm.cdc). Channel 0 is the player's; sfx.c uses 1.
+// ndsp started (on first use; without sdmc:/3ds/dspfirm.cdc it first copies the firmware from the HOME Menu, and
+// is false only when that fails too). Channel 0 is the player's; sfx.c uses 1.
 bool audio_dsp_ready(void);
 
 void audio_time_text(float seconds, char *out, size_t cap);  // "1:05", "1:02:09"
