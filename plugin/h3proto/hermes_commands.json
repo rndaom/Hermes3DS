@@ -1,0 +1,436 @@
+[
+ {
+  "name": "new",
+  "desc": "Start a new session (fresh session ID + history)",
+  "args": "[name]",
+  "aliases": [
+   "reset"
+  ]
+ },
+ {
+  "name": "save",
+  "desc": "Export the current conversation (bare /save shows usage)",
+  "args": "<json|md|html> [filename] [redact]",
+  "aliases": []
+ },
+ {
+  "name": "retry",
+  "desc": "Retry the last message (resend to agent)",
+  "args": "",
+  "aliases": []
+ },
+ {
+  "name": "undo",
+  "desc": "Back up N user turns and re-prompt (default 1)",
+  "args": "[N]",
+  "aliases": []
+ },
+ {
+  "name": "title",
+  "desc": "Set a title for the current session",
+  "args": "[name]",
+  "aliases": []
+ },
+ {
+  "name": "branch",
+  "desc": "Branch the current session (new thread on Discord/Telegram/Slack/Matrix; --here stays here)",
+  "args": "[--here] [name]",
+  "aliases": [
+   "fork"
+  ]
+ },
+ {
+  "name": "compress",
+  "desc": "Compress conversation context (add 'here [N]' to keep recent N turns; --preview shows what would happen)",
+  "args": "[here [N] | focus topic | --preview|--dry-run]",
+  "aliases": [
+   "compact"
+  ]
+ },
+ {
+  "name": "rollback",
+  "desc": "List or restore filesystem checkpoints (restores keep your hand-edits; --all overrides)",
+  "args": "[number] [--all]",
+  "aliases": []
+ },
+ {
+  "name": "stop",
+  "desc": "Kill all running background processes",
+  "args": "",
+  "aliases": []
+ },
+ {
+  "name": "discard",
+  "desc": "Drop a turn lost when Hermes restarted so this chat's queue runs again",
+  "args": "",
+  "aliases": []
+ },
+ {
+  "name": "pause",
+  "desc": "Pause new work globally (emergency stop); '/pause off' resumes",
+  "args": "[reason | off]",
+  "aliases": []
+ },
+ {
+  "name": "approve",
+  "desc": "Approve a pending dangerous command",
+  "args": "[session|always]",
+  "aliases": []
+ },
+ {
+  "name": "deny",
+  "desc": "Deny a pending dangerous command (optionally with a reason)",
+  "args": "[all] [reason]",
+  "aliases": []
+ },
+ {
+  "name": "bg",
+  "desc": "Run a prompt in a separate background session",
+  "args": "<prompt>",
+  "aliases": []
+ },
+ {
+  "name": "btw",
+  "desc": "Ask a side question about the current conversation without interrupting it",
+  "args": "<question>",
+  "aliases": []
+ },
+ {
+  "name": "agents",
+  "desc": "Show active agents and running tasks",
+  "args": "",
+  "aliases": [
+   "tasks"
+  ]
+ },
+ {
+  "name": "queue",
+  "desc": "Queue a prompt for the next turn, or list/edit/rm/move/clear queued prompts",
+  "args": "[<prompt>|list|edit N <prompt>|rm N|move A B|clear]",
+  "aliases": [
+   "q"
+  ]
+ },
+ {
+  "name": "steer",
+  "desc": "Inject a message after the next tool call without interrupting",
+  "args": "<prompt>",
+  "aliases": [
+   "s"
+  ]
+ },
+ {
+  "name": "goal",
+  "desc": "Set a standing goal Hermes works on across turns until achieved",
+  "args": "[text | -- <text> | draft <text> | show | gate add <cmd> | pause | resume | clear | status | wait <pid> | unwait]",
+  "aliases": []
+ },
+ {
+  "name": "heartbeat",
+  "desc": "Set a recurring prompt that re-enters this session when idle",
+  "args": "[every <interval> <prompt> | status | pause | resume | clear]",
+  "aliases": [
+   "hb"
+  ]
+ },
+ {
+  "name": "refine",
+  "desc": "Review this conversation now and save lessons to memory/skills",
+  "args": "[focus instructions]",
+  "aliases": []
+ },
+ {
+  "name": "review",
+  "desc": "Spawn an independent subagent to review the work just discussed (PR, code, docs)",
+  "args": "[review instructions]",
+  "aliases": []
+ },
+ {
+  "name": "loop",
+  "desc": "Re-run a prompt on a recurring interval in this session",
+  "args": "[interval] <prompt> [--times N] [--until <condition>] | status | pause | resume | stop",
+  "aliases": [
+   "proactive"
+  ]
+ },
+ {
+  "name": "plan",
+  "desc": "Write a markdown implementation plan to .hermes/plans/ without executing anything",
+  "args": "[task]",
+  "aliases": []
+ },
+ {
+  "name": "moa",
+  "desc": "Run one prompt through the default Mixture of Agents preset, then restore your model",
+  "args": "<prompt>",
+  "aliases": []
+ },
+ {
+  "name": "subgoal",
+  "desc": "Add or manage extra criteria on the active goal",
+  "args": "[text | remove N | clear]",
+  "aliases": []
+ },
+ {
+  "name": "status",
+  "desc": "Show session, model, token, and context info",
+  "args": "",
+  "aliases": []
+ },
+ {
+  "name": "egress",
+  "desc": "Show Docker egress proxy status",
+  "args": "[status]",
+  "aliases": []
+ },
+ {
+  "name": "context",
+  "desc": "Show detailed context window view with usage gauge, category breakdown, compression stats, and throughput",
+  "args": "[all]",
+  "aliases": [
+   "ctx"
+  ]
+ },
+ {
+  "name": "whoami",
+  "desc": "Show your slash command access (admin / user)",
+  "args": "",
+  "aliases": []
+ },
+ {
+  "name": "profile",
+  "desc": "Show active profile name and home directory",
+  "args": "",
+  "aliases": []
+ },
+ {
+  "name": "sethome",
+  "desc": "Set this chat as the home channel",
+  "args": "",
+  "aliases": [
+   "set-home"
+  ]
+ },
+ {
+  "name": "resume",
+  "desc": "Resume a previously-named session",
+  "args": "[name]",
+  "aliases": []
+ },
+ {
+  "name": "sessions",
+  "desc": "Browse and resume previous sessions",
+  "args": "",
+  "aliases": []
+ },
+ {
+  "name": "model",
+  "desc": "Switch model (session-scoped; --global to persist)",
+  "args": "[model] [--provider name] [--reasoning level] [--global|--session] [--refresh]",
+  "aliases": []
+ },
+ {
+  "name": "codex-runtime",
+  "desc": "Toggle codex app-server runtime for OpenAI/Codex models",
+  "args": "[auto|codex_app_server]",
+  "aliases": [
+   "codex_runtime"
+  ]
+ },
+ {
+  "name": "personality",
+  "desc": "Set a predefined personality",
+  "args": "[name]",
+  "aliases": []
+ },
+ {
+  "name": "diff",
+  "desc": "Show git changes in the working directory",
+  "args": "[staged|all|session] [--stat] [path...]",
+  "aliases": []
+ },
+ {
+  "name": "footer",
+  "desc": "Toggle gateway runtime-metadata footer on final replies",
+  "args": "[on|off|status]",
+  "aliases": []
+ },
+ {
+  "name": "yolo",
+  "desc": "Toggle YOLO mode (skip all dangerous command approvals)",
+  "args": "",
+  "aliases": []
+ },
+ {
+  "name": "approvals",
+  "desc": "Show or set the persistent dangerous-command approval mode",
+  "args": "[manual|smart|off]",
+  "aliases": []
+ },
+ {
+  "name": "reasoning",
+  "desc": "Manage reasoning effort and display",
+  "args": "[level|show|hide|full|clamp] [--global]",
+  "aliases": []
+ },
+ {
+  "name": "fast",
+  "desc": "Fast mode — OpenAI Priority Processing / Anthropic Fast Mode (normal/fast/auto/cold/ultrafast)",
+  "args": "[normal|fast|auto|cold|ultrafast|status] [--global]",
+  "aliases": []
+ },
+ {
+  "name": "voice",
+  "desc": "Toggle voice mode",
+  "args": "[on|off|tts|status]",
+  "aliases": []
+ },
+ {
+  "name": "busy",
+  "desc": "Control how messages behave while Hermes is working",
+  "args": "[queue|steer|interrupt|status]",
+  "aliases": []
+ },
+ {
+  "name": "autoprune",
+  "desc": "Turn automatic pruning of old sessions on or off",
+  "args": "[on|off|later|status]",
+  "aliases": []
+ },
+ {
+  "name": "memory",
+  "desc": "Review pending memory writes / toggle the approval gate",
+  "args": "[pending|approve|reject|approval] [id|on|off]",
+  "aliases": []
+ },
+ {
+  "name": "bundles",
+  "desc": "List skill bundles (aliases /<name> for multiple skills)",
+  "args": "",
+  "aliases": []
+ },
+ {
+  "name": "learn",
+  "desc": "Learn a reusable skill from anything you describe (dirs, URLs, this chat, notes)",
+  "args": "<what to learn from>",
+  "aliases": []
+ },
+ {
+  "name": "init",
+  "desc": "Generate or update AGENTS.md project instructions from a repo scan",
+  "args": "[notes]",
+  "aliases": []
+ },
+ {
+  "name": "suggestions",
+  "desc": "Review suggested automations (accept/dismiss)",
+  "args": "[accept|dismiss N | catalog]",
+  "aliases": [
+   "suggest"
+  ]
+ },
+ {
+  "name": "blueprint",
+  "desc": "Set up an automation from a blueprint template",
+  "args": "[name] [slot=value ...]",
+  "aliases": [
+   "bp"
+  ]
+ },
+ {
+  "name": "curator",
+  "desc": "Background skill maintenance (status, run, pin, archive, list-archived)",
+  "args": "[subcommand]",
+  "aliases": []
+ },
+ {
+  "name": "kanban",
+  "desc": "Multi-profile collaboration board (tasks, links, comments)",
+  "args": "[subcommand]",
+  "aliases": []
+ },
+ {
+  "name": "reload-mcp",
+  "desc": "Reload MCP servers from config",
+  "args": "",
+  "aliases": [
+   "reload_mcp"
+  ]
+ },
+ {
+  "name": "reload-skills",
+  "desc": "Re-scan ~/.hermes/skills/ for newly installed or removed skills",
+  "args": "",
+  "aliases": [
+   "reload_skills"
+  ]
+ },
+ {
+  "name": "commands",
+  "desc": "Browse all commands and skills (paginated)",
+  "args": "[page]",
+  "aliases": []
+ },
+ {
+  "name": "help",
+  "desc": "Show available commands (/help skills lists skill commands, /help <text> filters)",
+  "args": "[skills|<filter>]",
+  "aliases": []
+ },
+ {
+  "name": "restart",
+  "desc": "Gracefully restart the gateway after draining active runs",
+  "args": "",
+  "aliases": []
+ },
+ {
+  "name": "usage",
+  "desc": "Show token usage and rate limits; `reset` redeems a banked Codex limit reset",
+  "args": "[reset [--force]]",
+  "aliases": []
+ },
+ {
+  "name": "login",
+  "desc": "Sign in with a Nous account (keeps your connectors)",
+  "args": "",
+  "aliases": []
+ },
+ {
+  "name": "topup",
+  "desc": "Show your Nous balance and manage billing on the portal",
+  "args": "",
+  "aliases": []
+ },
+ {
+  "name": "insights",
+  "desc": "Show usage insights and analytics",
+  "args": "[days]",
+  "aliases": []
+ },
+ {
+  "name": "platform",
+  "desc": "Pause, resume, or list a failing gateway platform",
+  "args": "<pause|resume|list> [name]",
+  "aliases": []
+ },
+ {
+  "name": "update",
+  "desc": "Update Hermes Agent to the latest version",
+  "args": "",
+  "aliases": []
+ },
+ {
+  "name": "version",
+  "desc": "Show Hermes Agent version",
+  "args": "",
+  "aliases": [
+   "v"
+  ]
+ },
+ {
+  "name": "debug",
+  "desc": "Upload debug report (system info + logs) and get shareable links",
+  "args": "[nous|local]",
+  "aliases": []
+ }
+]

@@ -137,6 +137,29 @@ void chat_clear(Chat *c)
     c->version++;
 }
 
+void chat_reconnected(Chat *c)
+{
+    json_decref(c->approval);
+    json_decref(c->clarify);
+    c->approval = c->clarify = NULL;
+    c->prompt_req = 0;
+    c->stopping = false;
+    c->version++;
+}
+
+void chat_link_lost(Chat *c)
+{
+    for (int i = 0; i < c->n; i++) {
+        Msg *m = c->m[i];
+        if (m->role == R_USER && m->pending && m->req_id) {
+            m->pending = false;
+            m->failed = true;
+            m->dirty = true;
+        }
+    }
+    c->version++;
+}
+
 void chat_free(Chat *c)
 {
     chat_clear(c);
@@ -312,6 +335,7 @@ void chat_handle(Chat *c, json_t *msg)
                           : !strcmp(choice, "deny")    ? "Denied"
                           : !strcmp(choice, "timeout") ? "Timed out"
                                                        : "Done";
+        c->prompt_req = 0;
         if (c->approval && !strcmp(jstr(c->approval, "req"), req)) {
             char buf[600];
             snprintf(buf, sizeof buf, "Command approval\n%s", jstr(c->approval, "command"));
@@ -338,10 +362,12 @@ void chat_handle(Chat *c, json_t *msg)
         for (size_t i = 0; i < json_array_size(choices) && n < (int)sizeof buf - 8; i++)
             n += snprintf(buf + n, sizeof buf - (size_t)n, "\n%u. %s", (unsigned)i + 1,
                           json_string_value(json_array_get(choices, i)) ?: "");
-        prompt_card(c, "c", jstr(msg, "cid"), buf);
+        snprintf(mid, sizeof mid, "c:%s", jstr(msg, "cid"));
+        if (!find(c, mid)) prompt_card(c, "c", jstr(msg, "cid"), buf);  // re-sent after a reconnect: one card
     } else if (!strcmp(t, "clarify_done")) {
         const char *cid = jstr(msg, "cid");
         resolve_card(c, "c", cid, "Answered");
+        c->prompt_req = 0;
         if (c->clarify && !strcmp(jstr(c->clarify, "cid"), cid)) {
             json_decref(c->clarify);
             c->clarify = NULL;
@@ -351,9 +377,20 @@ void chat_handle(Chat *c, json_t *msg)
         for (int i = c->n - 1; i >= 0; i--)
             if (c->m[i]->role == R_USER && c->m[i]->req_id == (uint32_t)id) {
                 c->m[i]->pending = false;
+                c->m[i]->failed = false;  // it did arrive (resent after a reconnect)
                 c->m[i]->dirty = true;
                 break;
             }
+    } else if (!strcmp(t, "approve_r")) {
+        c->prompt_req = 0;
+    } else if (!strcmp(t, "answer_r")) {
+        c->prompt_req = 0;
+        if (!json_is_true(json_object_get(msg, "ok")) && c->clarify) {  // no longer waiting on the PC
+            resolve_card(c, "c", jstr(c->clarify, "cid"), "Expired");
+            json_decref(c->clarify);
+            c->clarify = NULL;
+            chat_notice(c, "That question had already been answered or had expired.");
+        }
     } else if (!strcmp(t, "heard")) {  // the transcript of a voice message (protocol.md §4.4.1)
         json_int_t id = json_integer_value(json_object_get(msg, "req"));
         const char *text = jstr(msg, "text");
@@ -372,6 +409,30 @@ void chat_handle(Chat *c, json_t *msg)
             }
     } else if (!strcmp(t, "error")) {
         const char *text = jstr(msg, "msg");
+        uint32_t id = (uint32_t)json_integer_value(json_object_get(msg, "id"));
+        if (id && id == c->prompt_req) {  // the approval / question this answered is gone on the PC
+            c->prompt_req = 0;
+            if (c->approval) {
+                resolve_card(c, "a", jstr(c->approval, "req"), "Expired");
+                json_decref(c->approval);
+                c->approval = NULL;
+                if (c->clarify) c->prompt_since = osGetTime();
+            } else if (c->clarify) {
+                resolve_card(c, "c", jstr(c->clarify, "cid"), "Expired");
+                json_decref(c->clarify);
+                c->clarify = NULL;
+            }
+            chat_notice(c, "That question had already been answered or had expired.");
+            c->version++;
+            return;
+        }
+        for (int i = c->n - 1; id && i >= 0; i--)
+            if (c->m[i]->role == R_USER && c->m[i]->req_id == id && c->m[i]->pending) {
+                c->m[i]->pending = false;  // the PC refused the send: say so on the bubble
+                c->m[i]->failed = true;
+                c->m[i]->dirty = true;
+                break;
+            }
         chat_notice(c, "Error: %s", text[0] ? text : jstr(msg, "code"));
     } else if (!strcmp(t, "status_r")) {
         json_t *s = json_object_get(msg, "session");

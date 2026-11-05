@@ -1,11 +1,15 @@
 """Keeps the away-from-home address (protocol.md §2.4) current while the gateway runs.
 
+Away access is opt-in: it publishes a public Tailscale Funnel, so nothing happens until the owner asks for it with
+`hermes 3ds away on` (a flag file in the plugin data folder), `away: on` in the config, or an `away_address`.
 Modes (config `platforms.3ds.away`, env THREEDS_AWAY):
-  auto  (default) Tailscale Funnel when Tailscale is installed, otherwise no away route
-  on    the same, but a missing Tailscale is logged as a warning
-  off   no away listener; the 3DS is told to forget its away address
-`away_address: host:port` advertises a tunnel you run yourself (TLS-terminating, forwarding plain TCP to the
-away listener) instead of using Tailscale.
+  unset (default) off, unless `hermes 3ds away on` was run or `away_address` is set
+  on    Tailscale Funnel; a missing Tailscale is logged as a warning
+  auto  the same, but a missing Tailscale is only logged as info
+  off   no away listener and Tailscale is never touched, whatever the CLI flags say
+`hermes 3ds away off` (another flag file) turns it off over `away: on|auto`. When off, paired 3DSes are told to
+forget their away address. `away_address: host:port` advertises a tunnel you run yourself (TLS-terminating,
+forwarding plain TCP to the away listener) instead of using Tailscale.
 
 The latest outcome goes to away_status.json in the plugin data folder for `hermes 3ds away` / `pair` to show.
 """
@@ -28,10 +32,14 @@ RECHECK_OK = 600.0     # re-verify a working funnel (name change, someone turned
 RECHECK_FAIL = 60.0    # Tailscale not running / not signed in yet
 STATUS_FILE = "away_status.json"
 DISABLED_FILE = "away_off"  # written by `hermes 3ds away off`
+ENABLED_FILE = "away_on"    # written by `hermes 3ds away on`
 
 
 def parse_mode(value: Any) -> str:
-    v = str(value if value is not None else "auto").strip().lower()
+    """'' when unset, else off, on or auto."""
+    v = str(value if value is not None else "").strip().lower()
+    if not v:
+        return ""
     if v in ("0", "false", "no", "off", "disabled"):
         return "off"
     if v in ("1", "true", "yes", "on", "enabled"):
@@ -65,6 +73,19 @@ def read_status(data_dir: Path) -> dict | None:
 
 def disabled_by_user(data_dir: Path) -> bool:
     return (data_dir / DISABLED_FILE).exists()
+
+
+def enabled_by_user(data_dir: Path) -> bool:
+    return (data_dir / ENABLED_FILE).exists()
+
+
+def effective_mode(configured: str, data_dir: Path, address: dict | None) -> str:
+    """The mode the gateway runs with: `configured` is parse_mode() of the config value."""
+    if configured == "off" or disabled_by_user(data_dir):
+        return "off"
+    if configured:
+        return configured
+    return "on" if address or enabled_by_user(data_dir) else "off"
 
 
 class AwayManager:

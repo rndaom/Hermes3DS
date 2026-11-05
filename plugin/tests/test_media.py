@@ -212,6 +212,8 @@ async def test_attachments_in_msg_and_replay(server):
     await server.post_message(key.public, "m1", "here", attach=att)
     ev = await c.next_event("msg")
     assert ev["attach"] == att and ev["text"] == "here"
+    await c.channel.send({"t": "pong"})  # the app is heard from after m1 (as its pings do): m1 arrived
+    await asyncio.sleep(0.05)
     await c.close()
     await asyncio.sleep(0.05)
     await server.post_message(key.public, "m2", "", attach=att)  # offline

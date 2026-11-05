@@ -2,8 +2,10 @@
 
 import asyncio
 import importlib
+import itertools
 import sys
 import time
+import types
 
 import pytest
 
@@ -105,15 +107,11 @@ def test_links_still_parse():
     assert text == "see the docs now" and spans == [[4, 12, "link", "https://example.com/a"]]
 
 
-async def test_session_visibility_awaits_hermes_async_check(adapter_mod):  # noqa: F811
+def test_session_visibility_is_this_chats_lane(adapter_mod):  # noqa: F811
     compat = importlib.import_module("plugin.compat")
-
-    class Runner:
-        async def _resume_row_visible(self, source, row, allow_all):
-            return row["source"] == "3ds"
-
-    assert await compat._visible(Runner(), None, {"source": "3ds"}) is True
-    assert await compat._visible(Runner(), None, {"source": "discord"}) is False
+    assert compat._visible({"session_key": "agent:3ds:dm:x"}, "agent:3ds:dm:x") is True
+    assert compat._visible({"session_key": "agent:discord:dm:y"}, "agent:3ds:dm:x") is False
+    assert compat._visible(None, "agent:3ds:dm:x") is False
 
 
 async def test_open_on_pc_refusals(adapter_mod, tmp_path, monkeypatch):  # noqa: F811
@@ -122,7 +120,7 @@ async def test_open_on_pc_refusals(adapter_mod, tmp_path, monkeypatch):  # noqa:
 
     a = adapter_mod.ThreeDSAdapter.__new__(adapter_mod.ThreeDSAdapter)
     a._blobs = BlobStore(tmp_path / "blobs")
-    for name in ("run.sh", "setup.deb", "payload"):
+    for name in ("run.sh", "setup.deb", "payload", "app.pif", "macro.doc", "page.html", "disk.iso"):
         src = tmp_path / name
         src.write_bytes(b"#!/bin/sh\n")
         ref = a._blobs.put_file(src, name=name)
@@ -138,3 +136,64 @@ async def test_open_on_pc_refusals(adapter_mod, tmp_path, monkeypatch):  # noqa:
         with pytest.raises(RequestError) as err:
             await a.open_blob(ref["id"])
         assert err.value.code == "unavailable"
+
+
+async def test_reauthorize_native_roles_follows_pairing(adapter_mod, tmp_path):  # noqa: F811
+    store = DeviceStore(tmp_path / "devices.json")
+    dev = store.add(KeyPair().public, "3DS")
+    a = adapter_mod.ThreeDSAdapter.__new__(adapter_mod.ThreeDSAdapter)
+    a._server = types.SimpleNamespace(devices=store)
+
+    def source(**kw):
+        fields = {"chat_type": "dm", "user_id": dev.fp, "chat_id": adapter_mod.chat_id_for(dev)}
+        return types.SimpleNamespace(**{**fields, **kw})
+
+    assert await a.reauthorize_native_roles(source()) is True
+    assert await a.reauthorize_native_roles(source(user_id="someone-else")) is False
+    assert await a.reauthorize_native_roles(source(chat_id="dev:other")) is False
+    assert await a.reauthorize_native_roles(source(chat_type="group")) is False
+    store.remove(dev.fp)
+    assert await a.reauthorize_native_roles(source()) is False
+    a._server = None
+    assert await a.reauthorize_native_roles(source()) is False
+
+
+async def test_message_ids_do_not_repeat_after_a_gateway_restart(adapter_mod, monkeypatch):  # noqa: F811
+    # Hermes refuses a reused inbound id with other content (admission_conflict), so a restarted gateway
+    # must not hand out u1, u2... again.
+    def run(tag):
+        monkeypatch.setattr(adapter_mod, "_RUN_TAG", tag)
+        a = adapter_mod.ThreeDSAdapter.__new__(adapter_mod.ThreeDSAdapter)
+        a._ids = itertools.count(1)
+        return [a._mid("u"), a._mid("m")]
+
+    first, second = run("a1b2c3d4e5"), run("f6a7b8c9d0")
+    assert first == ["ua1b2c3d4e5-1", "ma1b2c3d4e5-2"] and not set(first) & set(second)
+    assert len(adapter_mod._RUN_TAG) == 10
+    # Each adapter Hermes makes in the same process (reconnect watcher, profiles) gets a tag of its own.
+    a, b = (adapter_mod.ThreeDSAdapter.__new__(adapter_mod.ThreeDSAdapter) for _ in range(2))
+    for ad, tag in ((a, "0123456789"), (b, "9876543210")):
+        ad._ids, ad._run_tag = itertools.count(1), tag
+    assert a._mid("u") != b._mid("u")
+    assert len(f"s{'f' * 10}-{10 ** 9}") <= 23  # speech ids live in char[24] on the 3DS (mids in char[32])
+
+
+async def test_what_went_into_a_dead_connection_is_replayed(server):
+    # A 3DS that sleeps or loses Wi-Fi leaves a socket that still takes writes until the idle timeout, so
+    # whatever changed after it was last heard from must go out again on reconnect (the app dedupes by mid).
+    c, key = await _pair(server)
+    await server.post_message(key.public, "m1", "seen")
+    await c.next_event("msg")
+    await c.channel.send({"t": "pong"})  # heard from after m1
+    await asyncio.sleep(0.05)
+    await server.post_message(key.public, "m2", "maybe lost")  # written, but the app goes quiet
+    await server.post_message(key.public, "m3", "gone", final=False)
+    await server.delete_message(key.public, "m3")
+    await c.close()
+    await asyncio.sleep(0.05)
+    c2 = await Client.connect("127.0.0.1", server.port, static=key, server_key=server.static.public)
+    assert (await c2.next_event("delete"))["mid"] == "m3"
+    assert (await c2.next_event("msg"))["mid"] == "m2"
+    await asyncio.sleep(0.1)
+    assert all(ev.get("mid") != "m1" for ev in list(c2.events._queue))
+    await c2.close()

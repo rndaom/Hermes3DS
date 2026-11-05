@@ -43,6 +43,13 @@ APP_TITLE	:=	Hermes
 APP_DESCRIPTION	:=	Hermes Agent on your 3DS
 APP_AUTHOR	:=	Random
 ICON		:=	meta/icon.png
+# The version the app reports and the CIA's title version. The HOME Menu caches each title's icon by title ID and
+# version, so a reinstall with the same version keeps showing the old icon: bump it for every build that goes
+# onto a console. Test builds stay below the first release, 0.1.0.
+VERSION_MAJOR	:=	0
+VERSION_MINOR	:=	1
+VERSION_MICRO	:=	0
+APP_VERSION	:=	$(VERSION_MAJOR).$(VERSION_MINOR).$(VERSION_MICRO)
 #---------------------------------------------------------------------------------
 # CIA (`make cia`, installs Hermes on the HOME Menu with FBI). Needs makerom and
 # bannertool on PATH. Art: meta/ (rebuild with tools/build_meta.py).
@@ -63,7 +70,7 @@ CFLAGS	:=	-g -Wall -Wextra -Wno-unused-parameter -O2 -mword-relocations -std=gnu
 			-ffunction-sections \
 			$(ARCH)
 
-CFLAGS	+=	$(INCLUDE) -D__3DS__
+CFLAGS	+=	$(INCLUDE) -D__3DS__ -DAPP_VERSION='"3ds-$(APP_VERSION)"'
 
 CXXFLAGS	:= $(CFLAGS) -fno-rtti -fno-exceptions -std=gnu++11
 
@@ -196,6 +203,7 @@ cia: all
 	@command -v bannertool >/dev/null 2>&1 || { echo "bannertool not found: get it from the 3ds-bannertool releases and put it on PATH"; exit 1; }
 	@bannertool makebanner -i $(BANNER_IMAGE) -a $(BANNER_AUDIO) -o $(BUILD)/banner.bnr
 	@makerom -f cia -o $(OUTPUT).cia -target t -exefslogo -rsf $(RSF) -elf $(OUTPUT).elf \
+		-ver $$(( ($(VERSION_MAJOR) << 10) | ($(VERSION_MINOR) << 4) | $(VERSION_MICRO) )) \
 		-icon $(OUTPUT).smdh -banner $(BUILD)/banner.bnr \
 		-DAPP_TITLE="$(APP_TITLE)" -DAPP_PRODUCT_CODE="$(APP_PRODUCT_CODE)" \
 		-DAPP_UNIQUE_ID="$(APP_UNIQUE_ID)" -DAPP_ROMFS="$(ROMFS)"

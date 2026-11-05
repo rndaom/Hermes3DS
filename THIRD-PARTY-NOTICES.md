@@ -14,6 +14,7 @@ statically links the following. Full licence texts are in `licenses/` (and `app/
 | [libpng](http://www.libpng.org/pub/png/libpng.html) | 1.6.53 | libpng (PNG Reference Library License v2) | linked, `licenses/libpng.txt` |
 | [zlib](https://zlib.net/) | 1.3.1 | zlib | linked, `licenses/zlib.txt` |
 | [Jansson](https://github.com/akheron/jansson) | 2.13 | MIT | linked, `licenses/jansson.txt` |
+| Photograph of the *Marble statue of Hermes*, The Metropolitan Museum of Art | 56.234.15 | CC0 1.0 | HOME icon and banner art (see below) |
 
 Mbed TLS is used under the Apache License 2.0.
 
@@ -27,6 +28,16 @@ Emoji graphics are from Twemoji 17.0.3, copyright 2019 Twitter, Inc. and other c
 jdecked and other contributors, licensed under [CC-BY 4.0](https://creativecommons.org/licenses/by/4.0/).
 Changes: the PNGs are scaled down to 32 px and repacked for the Nintendo 3DS by `tools/build_emoji.py`. The app
 shows this credit on its connect screen and ships it as `romfs:/emoji-credits.txt`.
+
+## HOME Menu icon and banner
+
+The icon and banner (`app/meta/icon.png`, `app/meta/banner.png`) are drawn from a photograph of the *Marble statue
+of Hermes* (Roman, Imperial, 1st or 2nd century CE; accession 56.234.15), which The Metropolitan Museum of Art
+publishes under [CC0](https://creativecommons.org/publicdomain/zero/1.0/) through its Open Access program:
+https://www.metmuseum.org/art/collection/search/254925 (image DP253642). `tools/art/hermes-marble.png` is a
+greyscale crop of it, and `tools/build_meta.py` dithers that into the pixel art. CC0 asks for no credit; it is
+listed so the art can be traced and rebuilt. The rest of the art, the lettering and the banner sound are made by
+`tools/build_meta.py` itself (no fonts or samples).
 
 ## The gateway plugin
 

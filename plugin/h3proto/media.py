@@ -174,6 +174,22 @@ def build_attachment_bytes(store: BlobStore, data: bytes, name: str, mime: str |
                      lambda m: store.put_bytes(data, m, name), data)
 
 
+def build_speech_attachment(store: BlobStore, pcm: bytes, rate: int, name: str = "reply.wav") -> dict[str, Any] | None:
+    """Spoken-reply attachment from raw PCM16 mono (streaming text-to-speech), or None when ffmpeg cannot encode it.
+    Blocking: run it in a thread. There is no `file`: the original would be a WAV several times the size of the
+    ADPCM the 3DS plays, and nobody saves a spoken reply."""
+    wav = audio.pcm16_wav(pcm, rate)
+    sound = audio.transcode(wav, name)
+    if sound is None:
+        return None
+    att: dict[str, Any] = {"kind": "audio", "name": name, "size": len(wav), "mime": "audio/wav",
+                           "audio": store.put_bytes(sound["data"], audio.MIME, name, role="audio"),
+                           "rate": sound["rate"], "block": sound["block"], "ms": sound["ms"], "voice": True}
+    if sound["cut"]:
+        att["cut"] = True
+    return att
+
+
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tif", ".tiff", ".ico"}
 
 

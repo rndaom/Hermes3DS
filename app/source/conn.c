@@ -3,21 +3,30 @@
 #include <stdio.h>
 #include <string.h>
 
+volatile int conn_abort;
+
 static int remaining(uint64_t deadline)
 {
     uint64_t now = plat_ms();
-    return now >= deadline ? 0 : (int)(deadline - now);
+    return conn_abort || now >= deadline ? 0 : (int)(deadline - now);
 }
 
-// Wait for `events` on the socket. 1 = ready, 0 = timeout, <0 = error.
+// Wait for `events` on the socket. 1 = ready, 0 = timeout, <0 = error. Polls in short slices so that
+// conn_abort ends a long wait (a handshake reply, a connect) within a fraction of a second.
 static int wait_fd(sock_t fd, short events, int timeout_ms)
 {
-    struct pollfd p = {.fd = fd, .events = events, .revents = 0};
-    int r = sock_poll(&p, 1, timeout_ms);
-    if (r < 0) return sock_errno() == SOCK_EINTR ? 0 : -1;
-    if (r == 0) return 0;
-    if (p.revents & (POLLERR | POLLNVAL)) return -1;
-    return 1;  // POLLHUP with pending data still reads; recv() then reports EOF
+    uint64_t deadline = plat_ms() + (uint64_t)(timeout_ms < 0 ? 0 : timeout_ms);
+    for (;;) {
+        int left = remaining(deadline);
+        struct pollfd p = {.fd = fd, .events = events, .revents = 0};
+        int r = sock_poll(&p, 1, left < 200 ? left : 200);
+        if (r < 0) return sock_errno() == SOCK_EINTR ? 0 : -1;
+        if (r > 0) {
+            if (p.revents & (POLLERR | POLLNVAL)) return -1;
+            return 1;  // POLLHUP with pending data still reads; recv() then reports EOF
+        }
+        if (left <= 200) return 0;
+    }
 }
 
 void conn_init(Conn *c)

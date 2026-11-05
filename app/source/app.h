@@ -108,7 +108,8 @@ void app_send_media(const char *id, uint8_t *data, size_t len, const char *mime,
                     json_t *fields, const char *text);
 void app_set_sounds(bool on);  // saved on the SD card
 void app_set_speak(bool on);   // saved, and Hermes' /voice on|off
-// What Y plays/pauses in the chat: the current track when it is in this chat, else its newest audio.
+// What Y plays/pauses in the chat: a reply being spoken, the current track when it is in this chat, else
+// its newest audio.
 const json_t *app_chat_audio(void);
 
 void app_init(void);

@@ -112,6 +112,7 @@ class Channel:
         self.transport = transport
         self.remote_static = transport.remote_static if transport else None
         self.out_filter: Callable[[dict[str, Any]], dict[str, Any]] | None = None  # rewrites JSON bodies sent
+        self.caps: frozenset[str] = frozenset()  # what the app's hello said it can do (protocol.md §4.3)
         self._send_lock = asyncio.Lock()
 
     @property

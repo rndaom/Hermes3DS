@@ -141,8 +141,8 @@ def explain(output: str) -> tuple[str, str]:
         return ("HTTPS certificates are off in your tailnet. Turn on \"HTTPS Certificates\" in the Tailscale "
                 "admin console (DNS page), then restart the Hermes gateway: " + url, url)
     if "access denied" in text or "permission" in text:
-        return ("Tailscale refused the change (access denied). On Linux run `sudo tailscale set "
-                "--operator=$USER` once, then restart the Hermes gateway.", "")
+        return ("Tailscale refused the change (access denied). On Linux, make your user the Tailscale operator "
+                "once (as root: `tailscale set --operator=$USER`), then restart the Hermes gateway.", "")
     if "flag provided but not defined" in text or "unknown flag" in text:
         return "This Tailscale is too old for Funnel TCP forwarding. Update Tailscale, then restart the gateway.", ""
     tail = output.strip().splitlines()[-1] if output.strip() else "no output"

@@ -207,6 +207,9 @@ class _Base:
     def strip_media_directives_for_display(text):
         return text
 
+    async def on_processing_start(self, event):
+        pass
+
 
 class _FakeServer:
     def __init__(self):

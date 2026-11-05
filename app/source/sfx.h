@@ -1,5 +1,5 @@
-// Short UI sounds (reply arrived, needs you, sent, recording stopped), synthesized at start-up and played on ndsp
-// channel 1 (the player has channel 0). Silent when muted in settings or without the DSP firmware.
+// Short UI sounds (reply arrived, needs you, sent, recording stopped), rendered by tones.c on first use and played
+// on ndsp channel 1 (the player has channel 0). Silent when muted in settings or without the DSP firmware.
 #pragma once
 
 #include <stdbool.h>

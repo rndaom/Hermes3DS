@@ -1,5 +1,5 @@
 #!/bin/sh
-# Host-side tests for the portable C code (Noise IK + codecs, blob cache pruning). Needs python and clang
+# Host-side tests for the portable C code (Noise IK + codecs, blob cache pruning, camera YUV). Needs python and clang
 # (or set CC=gcc).
 set -e
 cd "$(dirname "$0")"
@@ -23,6 +23,26 @@ DIR="$TMP/h3ds_test_cache.$$"
 rm -rf "$DIR" && mkdir -p "$DIR"
 "$OUT" "$DIR"
 rm -rf "$DIR"
+
+# The queue of spoken replies (plain C, no player).
+OUT="$TMP/h3ds_test_autoplay.exe"
+"$CC" -std=c99 -O2 -Wall -Wextra -Werror -D_CRT_SECURE_NO_WARNINGS test_autoplay.c ../source/autoplay.c -o "$OUT"
+"$OUT"
+
+# The camera's YUV (preview, JPEG planes, thumbnail, warm-up); with libjpeg-turbo, a real JPEG round trip too.
+OUT="$TMP/h3ds_test_yuv.exe"
+TJ=""
+if command -v pkg-config >/dev/null 2>&1 && pkg-config --exists libturbojpeg; then
+    TJ="-DHAVE_TURBOJPEG $(pkg-config --cflags --libs libturbojpeg)"
+fi
+# shellcheck disable=SC2086
+"$CC" -std=c99 -O2 -Wall -Wextra -Werror -D_CRT_SECURE_NO_WARNINGS test_yuv.c ../source/yuv.c $TJ -o "$OUT"
+"$OUT"
+
+# The UI sounds (lyre plucks).
+OUT="$TMP/h3ds_test_tones.exe"
+"$CC" -std=c99 -O2 -Wall -Wextra -Werror -D_CRT_SECURE_NO_WARNINGS test_tones.c ../source/tones.c $LIBM -o "$OUT"
+"$OUT"
 
 # IMA-ADPCM decoding (audio attachments) against ffmpeg's decoder, when ffmpeg is installed.
 if command -v ffmpeg >/dev/null 2>&1; then

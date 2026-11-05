@@ -32,7 +32,7 @@ CALLBACK_MAGIC = b"H3DS<"  # "call me back": the client can reach us by UDP but 
 CALLBACK_TIMEOUT = 5.0
 CALLBACK_MIN_INTERVAL = 1.0  # per source address
 CALLBACK_MAX_PENDING = 4
-AWAY_MAX_HANDSHAKES = 8  # unauthenticated handshakes in flight on the internet-facing away listener
+AWAY_MAX_HANDSHAKES = 16  # unauthenticated handshakes in flight on the internet-facing away listener
 _UNKNOWN = object()  # away address not known yet (Tailscale setup still running)
 
 
@@ -63,6 +63,7 @@ class _Msg:
     ts: float
     attach: list | None = None  # attachments (protocol.md §4.7)
     dirty: bool = False  # changed while the device was offline
+    changed: float = 0.0  # time.monotonic() of the last change sent (or meant to be)
 
 
 @dataclass
@@ -71,7 +72,12 @@ class _DeviceState:
     messages: "OrderedDict[str, _Msg]" = field(default_factory=OrderedDict)
     pending: "OrderedDict[str, dict]" = field(default_factory=OrderedDict)  # approvals / clarifies
     deleted: set = field(default_factory=set)  # mids deleted while the device was offline
+    recent_deletes: "OrderedDict[str, float]" = field(default_factory=OrderedDict)  # mid -> when (monotonic)
     typing: bool = False
+    caps: frozenset = frozenset()  # what the app's last hello said, kept while it is offline
+    # When the device last sent an authenticated frame. A connection that died without closing (lid shut, Wi-Fi
+    # gone) still accepts writes until IDLE_TIMEOUT, so whatever changed after this may never have arrived.
+    last_rx: float = 0.0
 
 
 @dataclass
@@ -113,7 +119,9 @@ class Hermes3DSServer:
         self._states: dict[bytes, _DeviceState] = {}
         self._tcp: asyncio.base_events.Server | None = None
         self._away_tcp: asyncio.base_events.Server | None = None
-        self._away_handshakes = 0
+        # Away handshakes in flight, oldest first. When full, the oldest is dropped rather than the newcomer: idle
+        # sockets (every funnel peer looks like 127.0.0.1) can then delay the real 3DS but not lock it out.
+        self._away_pending: "OrderedDict[asyncio.Task, None]" = OrderedDict()
         self._away: Any = _UNKNOWN  # {"host","port"}, None (no away route) or _UNKNOWN
         self._udp: asyncio.DatagramTransport | None = None
         self._conn_tasks: set[asyncio.Task] = set()
@@ -235,9 +243,9 @@ class Hermes3DSServer:
     # --- connections --------------------------------------------------------
 
     async def _on_away_connection(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        if self._away_handshakes >= AWAY_MAX_HANDSHAKES:  # the internet can reach this one: bound the work
-            writer.close()
-            return
+        while len(self._away_pending) >= AWAY_MAX_HANDSHAKES:  # the internet can reach this one: bound the work
+            oldest, _ = self._away_pending.popitem(last=False)
+            oldest.cancel()
         await self._on_connection(reader, writer, away=True)
 
     async def _on_connection(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, *,
@@ -261,7 +269,7 @@ class Hermes3DSServer:
                 return reply
 
             if away:
-                self._away_handshakes += 1
+                self._away_pending[task] = None
             try:
                 channel, hello, reply = await asyncio.wait_for(
                     server_handshake(reader, writer, static=self.static if self.cfg.secure else None,
@@ -269,10 +277,12 @@ class Hermes3DSServer:
                     AWAY_HANDSHAKE_TIMEOUT if away else HANDSHAKE_TIMEOUT)
             finally:
                 if away:
-                    self._away_handshakes -= 1
+                    self._away_pending.pop(task, None)
             if reply["t"] != "welcome":
                 return
             device = authed["device"]
+            caps = hello.get("caps")
+            channel.caps = frozenset(c for c in caps if isinstance(c, str)) if isinstance(caps, list) else frozenset()
             if not draws_sprites(hello.get("caps")):
                 channel.out_filter = downgrade_message
             await self._attach(device, channel)
@@ -344,19 +354,32 @@ class Hermes3DSServer:
         info["chat"] = await self.backend.welcome_state(device)
         return info
 
+    def has_cap(self, device_key: bytes, cap: str, *, offline: bool = False) -> bool:
+        """Whether the app connected for this device said `cap` in its hello (protocol.md §4.3). `offline`: also
+        when no app is connected now but the last one said it."""
+        st = self._states.get(device_key)
+        if st and st.channel:
+            return cap in st.channel.caps
+        return bool(offline and st and cap in st.caps)
+
     async def _attach(self, device: Device, channel: Channel) -> None:
         st = self._states.setdefault(device.key, _DeviceState())
         old, st.channel = st.channel, channel
+        st.caps = channel.caps
         if old is not None:  # newest connection wins (e.g. reconnect after sleep)
             await old.close()
         # Replay what the device missed: changed messages, pending prompts, typing state. Iterate over copies
         # (agent output can arrive while we await), and skip an item that can't be framed rather than
         # dropping the connection on every reconnect.
+        # Also replay what changed since the device was last heard from: it may have gone into a dead socket.
+        # The app matches messages by mid, so a second copy of one that did arrive only updates it in place.
+        cutoff = st.last_rx
         deleted, st.deleted = list(st.deleted), set()
+        deleted += [mid for mid, at in st.recent_deletes.items() if at > cutoff and mid not in deleted]
         for mid in deleted:
             await self._send_replay(channel, {"t": "delete", "mid": mid})
         for m in list(st.messages.values()):
-            if m.dirty:
+            if m.dirty or m.changed > cutoff:
                 m.dirty = False
                 await self._send_replay(channel, self._msg_event(m))
         for prompt in list(st.pending.values()):
@@ -383,6 +406,9 @@ class Hermes3DSServer:
     async def _read_loop(self, device: Device, channel: Channel) -> None:
         while True:
             kind, body = await asyncio.wait_for(channel.recv(), IDLE_TIMEOUT)
+            st = self._states.get(device.key)
+            if st is not None and st.channel is channel:
+                st.last_rx = time.monotonic()
             if self.cfg.secure and self.devices.get(device.key) is None:  # unpaired while connected
                 log.info("3ds device %s was unpaired: closing its connection", device.fp)
                 return
@@ -572,7 +598,7 @@ class Hermes3DSServer:
                            kind: str = "reply", final: bool = True, spans: list | None = None,
                            attach: list | None = None) -> None:
         st = self._states.setdefault(device_key, _DeviceState())
-        m = _Msg(mid, role, kind, text, spans, final, time.time(), attach or None)
+        m = _Msg(mid, role, kind, text, spans, final, time.time(), attach or None, changed=time.monotonic())
         st.messages[mid] = m
         while len(st.messages) > MESSAGE_HISTORY:
             st.messages.popitem(last=False)
@@ -595,6 +621,7 @@ class Hermes3DSServer:
         if text == old and final and m.final and m.spans == old_spans:
             return True  # repeated finalize (REQUIRES_EDIT_FINALIZE): nothing new to send
         m.text, m.final = text, final
+        m.changed = time.monotonic()
         if st.channel is None or m.dirty:
             m.dirty = True
             return True
@@ -623,6 +650,9 @@ class Hermes3DSServer:
         st = self._states.get(device_key)
         if st is None or st.messages.pop(mid, None) is None:
             return False
+        st.recent_deletes[mid] = time.monotonic()
+        while len(st.recent_deletes) > MESSAGE_HISTORY:
+            st.recent_deletes.popitem(last=False)
         if not await self._send(st, {"t": "delete", "mid": mid}):
             st.deleted.add(mid)
         return True
@@ -672,6 +702,8 @@ class _Discovery(asyncio.DatagramProtocol):
 
     def datagram_received(self, data: bytes, addr: tuple) -> None:
         if self.transport is None:
+            return
+        if not is_lan_peer(addr):  # discovery is for the home network: no replies (or name) to the internet
             return
         if data[:5] == DISCOVERY_MAGIC:
             self.transport.sendto(self.server.discovery_reply(), addr)

@@ -56,6 +56,7 @@ typedef struct {
     json_t *approval;  // pending approval request, or NULL
     json_t *clarify;   // pending clarify request, or NULL
     u64 prompt_since;  // when the approval / clarify panel showing now appeared (osGetTime)
+    uint32_t prompt_req;  // id of the approve / answer request still waiting for its reply (0 = none)
     int clar_cur;      // clarify panel: highlighted choice
     uint32_t clar_sel; // clarify panel: ticked choices (multi-select; bit i = choice i)
     char title[96];
@@ -78,6 +79,12 @@ void chat_handle(Chat *c, json_t *msg);
 // `tz_off` converts their Unix `ts` to the 3DS clock's local time.
 void chat_load_history(Chat *c, json_t *items, long tz_off);
 void chat_clear(Chat *c);             // transcript and pending prompts
+// A new connection is up: drop the approval / clarify panels (the PC re-sends the ones still waiting; the rest
+// expired while the 3DS was away) and the stop state of a turn that ended meanwhile.
+void chat_reconnected(Chat *c);
+// The connection dropped: messages sent on it that the PC never acknowledged may be lost; mark them NOT SENT
+// (a late `send_r`, after a resend of the unsent frame, still clears that).
+void chat_link_lost(Chat *c);
 void chat_clear_transcript(Chat *c);  // messages only
 // Advance streaming reveals by dt seconds. Returns true while any text is still being revealed.
 bool chat_tick(Chat *c, float dt);

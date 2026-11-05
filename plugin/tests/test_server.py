@@ -151,6 +151,21 @@ async def test_emoji_sprites_only_for_matching_app(server):
     await new.close()
 
 
+async def test_the_apps_hello_caps_are_remembered_for_its_connection(server):
+    c, key = await _pair(server)  # the test client says jpeg, png, pcm16
+    assert server.has_cap(key.public, "png") and not server.has_cap(key.public, "voiceq")
+    assert not server.has_cap(b"x" * 32, "png")  # unknown device
+    c2 = await Client.connect("127.0.0.1", server.port, static=key, server_key=server.static.public,
+                              caps=["voiceq", 7])  # junk entries are ignored
+    assert (await c.next_event("_closed"))["t"] == "_closed"
+    assert server.has_cap(key.public, "voiceq") and not server.has_cap(key.public, "png")
+    await c2.close()
+    await asyncio.sleep(0.05)
+    assert not server.has_cap(key.public, "voiceq")  # gone with the connection
+    assert server.has_cap(key.public, "voiceq", offline=True)  # still known as what that app can do
+    assert not server.has_cap(b"x" * 32, "voiceq", offline=True)
+
+
 async def test_newest_connection_wins(server):
     c, key = await _pair(server)
     c2 = await Client.connect("127.0.0.1", server.port, static=key, server_key=server.static.public)

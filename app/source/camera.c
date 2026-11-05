@@ -1,6 +1,7 @@
 #include "camera.h"
 
 #include <citro2d.h>
+#include <malloc.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -12,74 +13,79 @@
 #include "sfx.h"
 #include "ui.h"
 #include "upload.h"
+#include "yuv.h"
 
 #define W 640  // VGA: the 3DS cameras' largest size, ~0.3 MP
 #define H 480
 #define FRAME_BYTES (W * H * 2)  // YUYV 4:2:2, the camera's native output
+#define NBUF 3  // one being received, the newest whole frame, the one on screen (or the photo)
 #define PW 320  // the preview: the picture halved, in a 512x256 RGB565 texture
 #define PH 240
 #define THUMB_W 120
 #define THUMB_H 90
 #define JPEG_Q 88
-#define STALL_MS 1500  // no frame for this long: restart the capture
-#define CAST_MAX 40    // the most the colour correction shifts U or V (of 255)
+#define STALL_NS (1500 * 1000000LL)        // no frame for this long: restart the capture
+#define STALLS_REACTIVATE 2                // that many in a row: turn the camera on again
+#define FROZEN_MS 1000                     // no new frame for this long: the shutter waits
+#define LOG_EACH 5                         // buffer errors and stalls logged one by one up to this, then counted
+#define REOPEN_WAIT_NS (500 * 1000000ULL)  // reopened while the last camera is still turning off
+#define EXIT_WAIT_NS (2000 * 1000000ULL)
+#define CAP_STACK (32 * 1024)
+#define ENC_STACK (64 * 1024)
 
 typedef enum { C_PREVIEW, C_REVIEW, C_ENCODE } CState;
 
+// The capture thread does every camera call, so none of them (CAMU_Activate takes 100-170 ms on an Old 3DS)
+// holds up the UI, and it re-arms the receive the moment a frame lands: the camera buffers only a few lines.
+// It outlives a close by a moment while it turns the camera off, so its state is apart from the screen's;
+// reap() frees it once the thread has ended.
 static struct {
-    bool open, cam_ok, tex_ok, have_frame, prep_drawn;
+    Thread th;
+    Handle wake;  // to the thread: a new request
+    uint8_t *buf[NBUF];
+    Handle err_ev;  // the thread's own: the camera's buffer-error event (it overflowed: the frame in flight is torn)
+    u32 xfer;       // the thread's own: the transfer unit
+    LightLock lock;  // guards the rest
+    // Requests (from the UI, and from APT for the HOME Menu and sleep).
+    u32 want;         // the camera wanted on
+    bool run, quit;   // capturing (the preview) or paused (a photo in review); the thread to end
+    bool away;        // in the HOME Menu or asleep: paused
+    bool reactivate;  // back from there: turn the camera on again
+    bool shutter;     // play the shutter sound
+    // Results.
+    bool failed;   // the camera couldn't be set up or turned on: the UI closes it
+    YuvConv conv;  // the camera's YUV (CAMU_GetSuitableY2rStandardCoefficient), set before the first gen
+    int ready;     // the newest whole frame the UI hasn't taken, or -1
+    u32 ready_sel; // the camera it came from
+    int held;      // the UI's frame (on screen, or the photo): never received into while held; -1 none
+    u32 gen;       // bumped each time a camera is turned on: its exposure and white balance start over
+    u32 frames, errors, stalls;
+} cap;
+
+static struct {
+    bool open, tex_ok, settled, have_frame, enc_ok;
     CState st;
-    u32 select;      // SELECT_OUT1 or SELECT_IN1
-    uint8_t *buf[2]; // receiving into buf[rx]; buf[!rx] holds the last whole frame
-    int du, dv;      // colour correction applied to U and V (most of the picture's average cast)
-    int mu, mv;      // the last preview frame's average cast, before correction (logged)
-    int rx;
-    Handle ev;
-    Handle err_ev;   // the camera's buffer-error event (a frame was lost): restart the capture
-    u32 xfer;
-    u64 last_frame;
-    int frames;
+    u32 select;        // SELECT_OUT1 or SELECT_IN1
+    YuvConv conv;
+    YuvSettle settle;  // the warm-up after the camera starts
+    YuvStats shown;    // the frame on screen (logged with the photo)
+    u32 seen_gen;
+    u64 warm_t0, last_frame;
     C3D_Tex tex;
     Tex3DS_SubTexture sub;
     char caption[1024];
+    aptHookCookie apt;
+    Thread enc;  // the JPEG encoder, below the UI's priority so "Preparing the photo" keeps moving
+    unsigned char *jpg, *tjpg;
+    unsigned long jlen, tlen;
+    u64 enc_ms;
 } cm;
-
-static inline uint32_t morton8(int x, int y)
-{
-    return (uint32_t)((x & 1) | ((y & 1) << 1) | ((x & 2) << 1) | ((y & 2) << 2) | ((x & 4) << 2) | ((y & 4) << 3));
-}
 
 static const Rect SHUTTER = {110, 60, 100, 100};
 static const Rect SWITCH = {10, 196, 145, 34}, BACK = {165, 196, 145, 34};
 static const Rect SEND = {10, 148, 300, 40}, CAPTION = {10, 196, 145, 34}, RETAKE = {165, 196, 145, 34};
 
-static void arm(void)
-{
-    if (cm.ev) return;
-    CAMU_SetReceiving(&cm.ev, cm.buf[cm.rx], PORT_CAM1, FRAME_BYTES, (s16)cm.xfer);
-}
-
-static void stop_capture(void)
-{
-    if (!cm.cam_ok) return;
-    CAMU_StopCapture(PORT_CAM1);
-    if (cm.ev) {
-        svcCloseHandle(cm.ev);
-        cm.ev = 0;
-    }
-}
-
-static void start_capture(void)
-{
-    if (!cm.cam_ok) return;
-    stop_capture();
-    CAMU_Activate(cm.select);
-    CAMU_ClearBuffer(PORT_CAM1);
-    CAMU_StartCapture(PORT_CAM1);
-    if (!cm.err_ev) CAMU_GetBufferErrorInterruptEvent(&cm.err_ev, PORT_CAM1);
-    cm.last_frame = osGetTime();
-    arm();
-}
+// --- capture thread ---------------------------------------------------------------------
 
 static bool cam_setup(void)
 {
@@ -96,13 +102,213 @@ static bool cam_setup(void)
         R_FAILED(rc = CAMU_SetAutoExposure(both, true)) ||
         R_FAILED(rc = CAMU_SetWhiteBalance(both, WHITE_BALANCE_AUTO)) ||
         R_FAILED(rc = CAMU_SetAutoWhiteBalance(both, true)) ||
-        R_FAILED(rc = CAMU_SetTrimming(PORT_CAM1, false)) || R_FAILED(rc = CAMU_GetMaxBytes(&cm.xfer, W, H)) ||
-        R_FAILED(rc = CAMU_SetTransferBytes(PORT_CAM1, cm.xfer, W, H))) {
+        R_FAILED(rc = CAMU_SetTrimming(PORT_CAM1, false)) || R_FAILED(rc = CAMU_GetMaxBytes(&cap.xfer, W, H)) ||
+        R_FAILED(rc = CAMU_SetTransferBytes(PORT_CAM1, cap.xfer, W, H)) ||
+        R_FAILED(rc = CAMU_GetBufferErrorInterruptEvent(&cap.err_ev, PORT_CAM1))) {
         log_printf("camera: setup failed %08lX", (unsigned long)rc);
         camExit();
         return false;
     }
+    // Which YUV the camera gives (range and matrix), so the preview and the JPEG take it as it is.
+    Y2RU_StandardCoefficient std = COEFFICIENT_ITU_R_BT_601;
+    if (R_FAILED(rc = CAMU_GetSuitableY2rStandardCoefficient(&std))) {
+        log_printf("camera: GetSuitableY2rStandardCoefficient failed %08lX", (unsigned long)rc);
+        std = COEFFICIENT_ITU_R_BT_601;
+    }
+    YuvConv conv;
+    yuv_conv_init(&conv, (YuvStd)std);
+    LightLock_Lock(&cap.lock);
+    cap.conv = conv;
+    LightLock_Unlock(&cap.lock);
+    log_printf("camera: YUV %s (%d), transfer unit %lu", yuv_std_name(conv.std), (int)std, (unsigned long)cap.xfer);
     return true;
+}
+
+// The buffer to receive into next: not the newest whole frame, not the UI's. Under the lock.
+static int free_buf(void)
+{
+    for (int i = 0; i < NBUF; i++)
+        if (i != cap.ready && i != cap.held) return i;
+    return 0;
+}
+
+static void cap_stop(Handle *done)
+{
+    CAMU_StopCapture(PORT_CAM1);
+    bool busy = true;  // the frame in flight may finish first: wait for it (a little over a frame at 10 fps)
+    for (int i = 0; i < 30 && R_SUCCEEDED(CAMU_IsBusy(&busy, PORT_CAM1)) && busy; i++) svcSleepThread(5 * 1000000LL);
+    if (*done) {
+        svcCloseHandle(*done);
+        *done = 0;
+    }
+}
+
+static void arm(Handle *done, int rx)
+{
+    Result rc = CAMU_SetReceiving(done, cap.buf[rx], PORT_CAM1, FRAME_BYTES, (s16)cap.xfer);
+    if (R_FAILED(rc)) {
+        log_printf("camera: SetReceiving failed %08lX", (unsigned long)rc);
+        *done = 0;  // the stall timeout restarts it
+    }
+}
+
+// (Re)start the capture into buffer rx. The camera itself is left as it is (no CAMU_Activate, which restarts
+// its auto exposure and white balance from scratch). Armed before started, so the data always has a home.
+static void cap_start(Handle *done, int rx)
+{
+    cap_stop(done);
+    CAMU_ClearBuffer(PORT_CAM1);
+    svcClearEvent(cap.err_ev);  // an error from before (paused, turning on) isn't this capture's
+    arm(done, rx);
+    if (*done) CAMU_StartCapture(PORT_CAM1);
+}
+
+static void count(u32 *n, const char *what)
+{
+    LightLock_Lock(&cap.lock);
+    u32 k = ++*n;
+    u32 frames = cap.frames;
+    LightLock_Unlock(&cap.lock);
+    if (k <= LOG_EACH) log_printf("camera: %s after %lu frames, restarting the capture", what, (unsigned long)frames);
+}
+
+static void capture_main(void *arg)
+{
+    bool ok = cam_setup();
+    if (!ok) {
+        LightLock_Lock(&cap.lock);
+        cap.failed = true;
+        LightLock_Unlock(&cap.lock);
+        return;
+    }
+    u32 active = SELECT_NONE;
+    bool running = false, dead = false;
+    Handle done = 0;
+    int rx = 0, streak = 0;  // streak: stalls in a row
+    for (;;) {
+        LightLock_Lock(&cap.lock);
+        u32 want = cap.want;
+        bool run = cap.run && !cap.away && !dead, quit = cap.quit, shutter = cap.shutter;
+        bool again = cap.reactivate && !cap.away;
+        cap.shutter = false;
+        if (again) cap.reactivate = false;
+        LightLock_Unlock(&cap.lock);
+        if (quit) break;
+        if (shutter) CAMU_PlayShutterSound(SHUTTER_SOUND_TYPE_NORMAL);
+        if (again || streak >= STALLS_REACTIVATE) {
+            if (streak >= STALLS_REACTIVATE) log_printf("camera: still no frames, turning the camera on again");
+            active = SELECT_NONE;  // (it is on: this only forces the CAMU_Activate below)
+            streak = 0;
+        }
+        if (want != active && !dead) {
+            cap_stop(&done);
+            running = false;
+            u64 t0 = osGetTime();
+            Result rc = CAMU_Activate(want);
+            log_printf("camera: %s camera on in %llu ms%s", want == SELECT_OUT1 ? "outer" : "inner",
+                       (unsigned long long)(osGetTime() - t0), R_FAILED(rc) ? " FAILED" : "");
+            active = want;
+            dead = R_FAILED(rc);
+            if (dead) run = false;
+            LightLock_Lock(&cap.lock);
+            cap.gen++;
+            cap.ready = -1;
+            cap.failed = dead;
+            LightLock_Unlock(&cap.lock);
+        }
+        if (run && !running) {
+            cap_start(&done, rx);  // the same buffer as before: an unfinished receive into it can't land elsewhere
+        } else if (!run && running) {
+            cap_stop(&done);
+        }
+        running = run;
+        Handle hs[3];
+        int n = 0, i_err = -1, i_done = -1;
+        hs[n++] = cap.wake;
+        if (running) {
+            i_err = n;
+            hs[n++] = cap.err_ev;
+        }
+        if (running && done) {
+            i_done = n;
+            hs[n++] = done;
+        }
+        s32 idx = -1;
+        // Camera events always with a timeout; with the capture paused, only a request can come.
+        Result rc = svcWaitSynchronizationN(&idx, hs, n, false, running ? STALL_NS : -1LL);
+        if (R_DESCRIPTION(rc) == RD_TIMEOUT) {
+            count(&cap.stalls, "no frame for 1.5 s");
+            if (++streak < STALLS_REACTIVATE) cap_start(&done, rx);
+        } else if (R_FAILED(rc)) {
+            log_printf("camera: wait failed %08lX", (unsigned long)rc);
+            svcSleepThread(100 * 1000000LL);
+        } else if (idx == i_err) {
+            svcClearEvent(cap.err_ev);  // (a one-shot event already is; harmless if so)
+            count(&cap.errors, "buffer error");
+            cap_start(&done, rx);  // the frame in flight is torn: receive it again from the top
+        } else if (idx == i_done) {
+            svcCloseHandle(done);
+            done = 0;
+            streak = 0;
+            LightLock_Lock(&cap.lock);
+            cap.ready = rx;
+            cap.ready_sel = active;
+            cap.frames++;
+            rx = free_buf();
+            LightLock_Unlock(&cap.lock);
+            arm(&done, rx);  // at once: the next frame is already on its way
+        }
+    }
+    cap_stop(&done);
+    if (active != SELECT_NONE) CAMU_Activate(SELECT_NONE);
+    svcCloseHandle(cap.err_ev);
+    camExit();
+}
+
+// Free a closed camera's thread and buffers once the thread has ended. True when nothing is left.
+static bool reap(u64 wait_ns)
+{
+    if (!cap.th) return true;
+    if (threadJoin(cap.th, wait_ns) != 0) return false;
+    log_printf("camera: off: %lu frames, %lu buffer errors, %lu stalls", (unsigned long)cap.frames,
+               (unsigned long)cap.errors, (unsigned long)cap.stalls);
+    threadFree(cap.th);
+    svcCloseHandle(cap.wake);
+    for (int i = 0; i < NBUF; i++) free(cap.buf[i]);
+    memset(&cap, 0, sizeof cap);
+    return true;
+}
+
+// Called from APT (any thread): pause in the HOME Menu and asleep, and start the camera over after.
+static void on_apt(APT_HookType hook, void *param)
+{
+    bool away = hook == APTHOOK_ONSUSPEND || hook == APTHOOK_ONSLEEP;
+    if (!away && hook != APTHOOK_ONRESTORE && hook != APTHOOK_ONWAKEUP) return;
+    LightLock_Lock(&cap.lock);
+    cap.away = away;
+    if (!away) cap.reactivate = true;
+    LightLock_Unlock(&cap.lock);
+    svcSignalEvent(cap.wake);
+}
+
+// --- open, close, requests --------------------------------------------------------------
+
+static void request(bool run, bool shutter)
+{
+    LightLock_Lock(&cap.lock);
+    cap.want = cm.select;
+    cap.run = run;
+    cap.shutter = shutter;
+    LightLock_Unlock(&cap.lock);
+    svcSignalEvent(cap.wake);
+}
+
+// Hide the preview and the shutter until the camera's exposure and white balance have settled again.
+static void warm_reset(void)
+{
+    memset(&cm.settle, 0, sizeof cm.settle);
+    cm.settled = cm.have_frame = false;
+    cm.warm_t0 = osGetTime();
 }
 
 void camera_open(void)
@@ -112,13 +318,34 @@ void camera_open(void)
         app_toast("Update the Hermes 3DS plugin on the PC to send photos");
         return;
     }
+    if (!reap(REOPEN_WAIT_NS)) {
+        app_toast("The camera is still turning off. Try again in a moment");
+        return;
+    }
     memset(&cm, 0, sizeof cm);
-    cm.buf[0] = malloc(FRAME_BYTES);
-    cm.buf[1] = malloc(FRAME_BYTES);
+    bool mem = true;
+    // Whole cache lines (FRAME_BYTES is a multiple of 32): no heap data shares a line the camera's DMA writes.
+    for (int i = 0; i < NBUF; i++) mem = (cap.buf[i] = memalign(32, FRAME_BYTES)) && mem;
     cm.tex_ok = C3D_TexInit(&cm.tex, 512, 256, GPU_RGB565);
-    if (!cm.buf[0] || !cm.buf[1] || !cm.tex_ok) {
-        app_toast("Not enough memory for the camera");
-        camera_close();
+    if (mem && cm.tex_ok) {
+        LightLock_Init(&cap.lock);
+        cap.ready = cap.held = -1;
+        cap.want = cm.select = SELECT_OUT1;
+        cap.run = true;
+        if (R_SUCCEEDED(svcCreateEvent(&cap.wake, RESET_ONESHOT))) {
+            s32 prio = 0x30;
+            svcGetThreadPriority(&prio, CUR_THREAD_HANDLE);
+            // Same core as the UI, just above it: it mostly waits, and must re-arm the moment a frame lands.
+            cap.th = threadCreate(capture_main, NULL, CAP_STACK, prio > 0x18 ? prio - 1 : prio, -2, false);
+        }
+    }
+    if (!cap.th) {
+        app_toast(mem && cm.tex_ok ? "The camera didn't start" : "Not enough memory for the camera");
+        if (cap.wake) svcCloseHandle(cap.wake);
+        for (int i = 0; i < NBUF; i++) free(cap.buf[i]);
+        memset(&cap, 0, sizeof cap);
+        if (cm.tex_ok) C3D_TexDelete(&cm.tex);
+        memset(&cm, 0, sizeof cm);
         return;
     }
     C3D_TexSetFilter(&cm.tex, GPU_LINEAR, GPU_LINEAR);
@@ -127,17 +354,10 @@ void camera_open(void)
     cm.sub = (Tex3DS_SubTexture){.width = PW, .height = PH, .left = 0, .top = 1.0f, .right = PW / 512.0f,
                                  .bottom = 1.0f - PH / 256.0f};
     cm.open = true;
-    cm.select = SELECT_OUT1;
     cm.st = C_PREVIEW;
-    u64 t0 = osGetTime();
-    cm.cam_ok = cam_setup();
-    if (!cm.cam_ok) {
-        app_toast("The camera didn't start");
-        camera_close();
-        return;
-    }
-    start_capture();
-    log_printf("camera: open (%llu ms)", (unsigned long long)(osGetTime() - t0));
+    aptHook(&cm.apt, on_apt, NULL);
+    warm_reset();
+    log_printf("camera: open");
     app.dirty = true;
 }
 
@@ -145,104 +365,57 @@ bool camera_is_open(void) { return cm.open; }
 
 void camera_close(void)
 {
-    stop_capture();
-    if (cm.err_ev) svcCloseHandle(cm.err_ev);
-    if (cm.cam_ok) {
-        CAMU_Activate(SELECT_NONE);
-        camExit();
+    if (!cm.open) return;
+    aptUnhook(&cm.apt);
+    if (cm.enc) {  // closed while encoding (Hermes asked something): it only reads the photo, and ends shortly
+        threadJoin(cm.enc, U64_MAX);
+        threadFree(cm.enc);
+        tjFree(cm.jpg);
+        tjFree(cm.tjpg);
     }
+    LightLock_Lock(&cap.lock);
+    cap.quit = true;
+    LightLock_Unlock(&cap.lock);
+    svcSignalEvent(cap.wake);  // it turns the camera off on its own time; reap() frees the rest
     if (cm.tex_ok) C3D_TexDelete(&cm.tex);
-    free(cm.buf[0]);
-    free(cm.buf[1]);
     memset(&cm, 0, sizeof cm);
+    reap(0);
     app.dirty = true;
 }
 
-static inline int clamp255(int v) { return v < 0 ? 0 : v > 255 ? 255 : v; }
-
-// The correction for a pixel of brightness y: full from y 48 up, fading to none at black, so dark areas stay
-// neutral instead of taking on the opposite tint.
-static inline int shade(int d, int y) { return y >= 48 ? d : d * y / 48; }
-
-// One pixel, full-range BT.601 (what the camera and JPEG use); u, v centred on 0.
-static inline void yuv_rgb(int y, int u, int v, int *r, int *g, int *b)
+void camera_exit(void)
 {
-    *r = clamp255(y + ((359 * v) >> 8));
-    *g = clamp255(y - ((88 * u + 183 * v) >> 8));
-    *b = clamp255(y + ((454 * u) >> 8));
-}
-
-// Halve a YUYV frame into the preview texture (2x2 average), tiled for the GPU, with the colour correction.
-// Also measures the frame's average colour cast and eases the correction towards cancelling part of it:
-// the 3DS cameras' white balance drifts green under screens and indoor light.
-static void to_texture(const uint8_t *src, bool measure)
-{
-    u16 *dst = cm.tex.data;
-    int32_t su = 0, sv = 0, n = 0;
-    for (int y = 0; y < PH; y++) {
-        const uint8_t *r0 = src + (size_t)(y * 2) * W * 2, *r1 = r0 + W * 2;
-        uint32_t row = (uint32_t)((y >> 3) * (512 >> 3)) * 64;
-        for (int x = 0; x < PW; x++) {
-            const uint8_t *a = r0 + x * 4, *b = r1 + x * 4;  // Y0 U Y1 V, two rows
-            int yy = (a[0] + a[2] + b[0] + b[2] + 2) >> 2;
-            int u = ((a[1] + b[1] + 1) >> 1) - 128, v = ((a[3] + b[3] + 1) >> 1) - 128;
-            if (yy > 40 && yy < 235) {  // dark pixels' colour is mostly noise, bright ones are clipped
-                su += u;
-                sv += v;
-                n++;
-            }
-            int rr, gg, bb;
-            yuv_rgb(yy, u + shade(cm.du, yy), v + shade(cm.dv, yy), &rr, &gg, &bb);
-            dst[row + (uint32_t)(x >> 3) * 64 + morton8(x & 7, y & 7)] = (u16)((rr >> 3) << 11 | (gg >> 2) << 5 | bb >> 3);
-        }
-    }
-    C3D_TexFlush(&cm.tex);
-    if (!measure || n < PW * PH / 50) return;  // too little to judge (a nearly black frame): keep what we have
-    int mu = su / n, mv = sv / n;
-    cm.mu = mu;
-    cm.mv = mv;
-    // Cancel most of it: the 3DS cameras tint the whole picture green (U and V both ~-20..-35 under screens and
-    // room light), which hides what Hermes is meant to see. A scene that really is one colour keeps a little.
-    int tu = -mu * 17 / 20, tv = -mv * 17 / 20;
-    int full = PW * PH / 4;  // with less than a quarter of the frame in mid-tones, trust the measure less
-    if (n < full) {
-        tu = tu * n / full;
-        tv = tv * n / full;
-    }
-    tu = tu < -CAST_MAX ? -CAST_MAX : tu > CAST_MAX ? CAST_MAX : tu;
-    tv = tv < -CAST_MAX ? -CAST_MAX : tv > CAST_MAX ? CAST_MAX : tv;
-    cm.du += (tu - cm.du) / 4;  // eased over a few frames so the preview doesn't flicker
-    cm.dv += (tv - cm.dv) / 4;
+    camera_close();
+    if (!reap(EXIT_WAIT_NS)) log_printf("camera: the capture thread didn't end");
 }
 
 static void take(void)
 {
     if (!cm.have_frame) return;
-    stop_capture();
-    CAMU_PlayShutterSound(SHUTTER_SOUND_TYPE_NORMAL);
-    to_texture(cm.buf[!cm.rx], false);  // exactly the frame that is kept, as it will be sent
-    cm.st = C_REVIEW;
+    request(false, true);  // paused, not off: a retake doesn't start the camera over
+    cm.st = C_REVIEW;      // the photo is the frame on screen (cap.held), exactly as it will be sent
     app.dirty = true;
 }
 
 static void retake(void)
 {
     cm.st = C_PREVIEW;
-    cm.have_frame = false;
-    start_capture();
+    warm_reset();  // short: the camera stayed on, so it is steady within a few frames
+    request(true, false);
     app.dirty = true;
 }
 
 static void switch_camera(void)
 {
     cm.select = cm.select == SELECT_OUT1 ? SELECT_IN1 : SELECT_OUT1;
-    cm.have_frame = false;
-    start_capture();
+    warm_reset();
+    request(true, false);
     app.dirty = true;
 }
 
 static void edit_caption(void)
 {
+    // (The system keyboard holds the app until it closes: the camera is paused meanwhile.)
     char buf[sizeof cm.caption];
     if (app_keyboard("A caption or a question about the photo", cm.caption, buf, sizeof buf, 300, true, "OK"))
         snprintf(cm.caption, sizeof cm.caption, "%s", buf);
@@ -250,12 +423,13 @@ static void edit_caption(void)
         cm.caption[0] = 0;  // cleared and confirmed (an empty caption is fine)
 }
 
-// The photo for the PC (JPEG) and the chat card's thumbnail, both cached under their ids, then the send.
-static void encode_and_send(void)
+// The encoder thread: the photo for the PC (JPEG) and the chat card's thumbnail. It reads the held frame,
+// which nothing writes while a photo is in review.
+static void encode_main(void *arg)
 {
     u64 t0 = osGetTime();
-    const uint8_t *frame = cm.buf[!cm.rx];
-    // Straight from the camera's YUV to JPEG (no RGB round trip): planes Y (W x H), U and V (W/2 x H).
+    const uint8_t *frame = cap.buf[cap.held];
+    // Straight from the camera's YUV to JPEG's (no RGB round trip): planes Y (W x H), Cb and Cr (W/2 x H).
     uint8_t *yp = malloc((size_t)W * H * 2), *up = yp ? yp + W * H : NULL, *vp = up ? up + W * H / 2 : NULL;
     uint8_t *thumb = malloc(THUMB_W * THUMB_H * 3);
     tjhandle tj = tjInitCompress();
@@ -263,32 +437,8 @@ static void encode_and_send(void)
     unsigned long jlen = 0, tlen = 0;
     bool ok = yp && thumb && tj;
     if (ok) {
-        for (size_t i = 0; i < (size_t)W * H / 2; i++) {
-            const uint8_t *q = frame + i * 4;
-            yp[i * 2] = q[0];
-            yp[i * 2 + 1] = q[2];
-            int y2 = (q[0] + q[2]) >> 1;
-            up[i] = (uint8_t)clamp255(q[1] + shade(cm.du, y2));
-            vp[i] = (uint8_t)clamp255(q[3] + shade(cm.dv, y2));
-        }
-        // Thumbnail: each pixel the mean of its area, then to RGB.
-        for (int y = 0; y < THUMB_H; y++)
-            for (int x = 0; x < THUMB_W; x++) {
-                int x0 = x * W / THUMB_W, x1 = (x + 1) * W / THUMB_W, y0 = y * H / THUMB_H, y1 = (y + 1) * H / THUMB_H;
-                u32 sy = 0, su = 0, sv = 0, n = 0;
-                for (int yy = y0; yy < y1; yy++)
-                    for (int xx = x0; xx < x1; xx++, n++) {
-                        sy += yp[(size_t)yy * W + xx];
-                        su += up[(size_t)yy * (W / 2) + xx / 2];
-                        sv += vp[(size_t)yy * (W / 2) + xx / 2];
-                    }
-                int r, g, b;
-                yuv_rgb((int)(sy / n), (int)(su / n) - 128, (int)(sv / n) - 128, &r, &g, &b);
-                uint8_t *t = thumb + (y * THUMB_W + x) * 3;
-                t[0] = (uint8_t)r;
-                t[1] = (uint8_t)g;
-                t[2] = (uint8_t)b;
-            }
+        yuv_planes(&cm.conv, frame, W, H, yp, up, vp);
+        yuv_thumb(yp, up, vp, W, H, thumb, THUMB_W, THUMB_H);
         const unsigned char *planes[3] = {yp, up, vp};
         ok = tjCompressFromYUVPlanes(tj, planes, W, NULL, H, TJSAMP_422, &jpg, &jlen, JPEG_Q, TJFLAG_FASTDCT) == 0 &&
              tjCompress2(tj, thumb, THUMB_W, 0, THUMB_H, TJPF_RGB, &tjpg, &tlen, TJSAMP_420, 75, TJFLAG_FASTDCT) == 0;
@@ -297,10 +447,42 @@ static void encode_and_send(void)
     free(yp);
     free(thumb);
     if (tj) tjDestroy(tj);
+    cm.jpg = jpg;
+    cm.tjpg = tjpg;
+    cm.jlen = jlen;
+    cm.tlen = tlen;
+    cm.enc_ok = ok;
+    cm.enc_ms = osGetTime() - t0;
+}
+
+static void start_encode(void)
+{
+    s32 prio = 0x30;
+    svcGetThreadPriority(&prio, CUR_THREAD_HANDLE);
+    // Below the UI and the network thread: the screen keeps moving, the connection keeps its pace.
+    cm.enc = threadCreate(encode_main, NULL, ENC_STACK, prio + 2 < 0x3F ? prio + 2 : 0x3F, -2, false);
+    if (!cm.enc) {
+        app_toast("Couldn't prepare the photo");
+        sfx_play(SFX_ERROR);
+        return;
+    }
+    cm.st = C_ENCODE;
+    app.dirty = true;
+}
+
+// Both JPEGs cached under their ids, then the send.
+static void finish_send(void)
+{
+    threadFree(cm.enc);
+    cm.enc = NULL;
+    unsigned char *jpg = cm.enc_ok ? cm.jpg : NULL, *tjpg = cm.tjpg;
+    unsigned long jlen = cm.jlen, tlen = cm.tlen;
+    if (!cm.enc_ok) tjFree(cm.jpg);
+    cm.jpg = cm.tjpg = NULL;
     char id[UPLOAD_ID_LEN], tid[UPLOAD_ID_LEN + 2];
     upload_new_id(id);
     snprintf(tid, sizeof tid, "%st", id);  // the thumbnail stays on the 3DS
-    uint8_t *data = ok ? malloc(jlen) : NULL;
+    uint8_t *data = jpg ? malloc(jlen) : NULL;
     if (data) {
         memcpy(data, jpg, jlen);
         blob_cache_put(id, data, jlen);
@@ -314,8 +496,13 @@ static void encode_and_send(void)
         cm.st = C_REVIEW;
         return;
     }
-    log_printf("camera: photo %lu bytes, thumb %lu, in %llu ms, cast u%+d v%+d, corrected u%+d v%+d",
-               jlen, tlen, (unsigned long long)(osGetTime() - t0), cm.mu, cm.mv, cm.du, cm.dv);
+    LightLock_Lock(&cap.lock);
+    u32 frames = cap.frames, errors = cap.errors, stalls = cap.stalls;
+    LightLock_Unlock(&cap.lock);
+    log_printf("camera: photo %lu bytes, thumb %lu, in %llu ms; Y %d, U %+d, V %+d (%s); %lu frames, %lu buffer "
+               "errors, %lu stalls",
+               jlen, tlen, (unsigned long long)cm.enc_ms, cm.shown.y, cm.shown.u, cm.shown.v,
+               yuv_std_name(cm.conv.std), (unsigned long)frames, (unsigned long)errors, (unsigned long)stalls);
     json_t *attach = json_pack("{s:s, s:s, s:I, s:{s:s, s:I, s:s}, s:i, s:i, s:{s:s, s:I, s:s}, s:i, s:i,"
                                " s:{s:s, s:I, s:s}}",
                                "kind", "image", "name", "Photo.jpg", "size", (json_int_t)jlen, "view", "id", id,
@@ -338,49 +525,58 @@ void camera_input(u32 down, u32 held, const touchPosition *t)
         else if ((down & KEY_X) || (t && rect_hit(&SWITCH, x, y))) switch_camera();
         else if ((down & KEY_B) || (t && rect_hit(&BACK, x, y))) camera_close();
     } else if (cm.st == C_REVIEW) {
-        if ((down & KEY_A) || (t && rect_hit(&SEND, x, y))) {
-            cm.st = C_ENCODE;  // drawn as "Preparing..." first, encoded on the next tick
-            app.dirty = true;
-        } else if ((down & KEY_Y) || (t && rect_hit(&CAPTION, x, y))) {
-            edit_caption();
-        } else if ((down & KEY_B) || (t && rect_hit(&RETAKE, x, y))) {
-            retake();
-        }
+        if ((down & KEY_A) || (t && rect_hit(&SEND, x, y))) start_encode();
+        else if ((down & KEY_Y) || (t && rect_hit(&CAPTION, x, y))) edit_caption();
+        else if ((down & KEY_B) || (t && rect_hit(&RETAKE, x, y))) retake();
     }
 }
 
 void camera_tick(void)
 {
-    if (!cm.open) return;
+    if (!cm.open) {
+        reap(0);  // a closed camera's thread, once it has turned the camera off
+        return;
+    }
     if (cm.st == C_ENCODE) {
-        if (!cm.prep_drawn) {  // let "Preparing the photo" reach the screen before the CPU is busy
-            cm.prep_drawn = true;
-            return;
+        if (threadJoin(cm.enc, 0) == 0) finish_send();
+        return;
+    }
+    if (cm.st != C_PREVIEW) return;
+    int f = -1;
+    LightLock_Lock(&cap.lock);
+    u32 gen = cap.gen;
+    bool failed = cap.failed;
+    if (gen != cm.seen_gen) cm.conv = cap.conv;
+    if (cap.ready >= 0 && cap.ready_sel == cm.select) cap.held = f = cap.ready;  // (a switch drops the old camera's)
+    cap.ready = -1;
+    LightLock_Unlock(&cap.lock);
+    if (failed) {
+        app_toast("The camera didn't start");
+        camera_close();
+        return;
+    }
+    if (gen != cm.seen_gen) {  // a camera was turned on: its exposure and white balance start over
+        cm.seen_gen = gen;
+        warm_reset();
+    }
+    if (f < 0) {
+        if (cm.have_frame && osGetTime() - cm.last_frame > FROZEN_MS) {  // stalled: no taking a stale picture
+            cm.have_frame = false;
+            app.dirty = true;
         }
-        cm.prep_drawn = false;
-        encode_and_send();
         return;
     }
-    if (cm.st != C_PREVIEW || !cm.cam_ok) return;
-    u64 now = osGetTime();
-    if (cm.err_ev && svcWaitSynchronization(cm.err_ev, 0) == 0) {
-        start_capture();  // the receive wasn't re-armed in time: the frame in flight is torn
-        return;
-    }
-    if (cm.ev && svcWaitSynchronization(cm.ev, 0) == 0) {
-        svcCloseHandle(cm.ev);
-        cm.ev = 0;
-        cm.rx = !cm.rx;  // that buffer is now the last whole frame
-        cm.have_frame = true;
-        cm.last_frame = now;
-        cm.frames++;
-        to_texture(cm.buf[!cm.rx], true);
-        arm();
-        app.dirty = true;
-    } else if (now - cm.last_frame > STALL_MS) {
-        log_printf("camera: no frame for %d ms, restarting the capture", STALL_MS);
-        start_capture();
-    }
+    cm.last_frame = osGetTime();
+    GSPGPU_InvalidateDataCache(cap.buf[f], FRAME_BYTES);  // read what the camera's DMA wrote, not old cache lines
+    YuvStats st;
+    yuv_preview(&cm.conv, cap.buf[f], W, H, cm.tex.data, 512, &st);
+    C3D_TexFlush(&cm.tex);
+    cm.shown = st;
+    if (!cm.settled && (cm.settled = yuv_settle(&cm.settle, &st)))
+        log_printf("camera: steady after %d frames, %llu ms (Y %d, U %+d, V %+d)", cm.settle.frames,
+                   (unsigned long long)(osGetTime() - cm.warm_t0), st.y, st.u, st.v);
+    cm.have_frame = cm.settled;
+    if (cm.have_frame) app.dirty = true;
 }
 
 bool camera_animating(void) { return cm.open && cm.st != C_REVIEW; }

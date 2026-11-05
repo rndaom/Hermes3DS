@@ -142,13 +142,15 @@ Outside the home network the 3DS reaches the PC through **Tailscale Funnel**, wh
     ──plain TCP──▶ plugin away listener 127.0.0.1:7339 ──▶ Noise IK (§3) and frames (§1.1), unchanged
 ```
 
+- Away access is opt-in (`hermes 3ds away on`, `away: on|auto` in the config, or `away_address`); until then the
+  plugin binds no away listener, never runs `tailscale`, and tells paired 3DSes to forget their away address.
 - The plugin turns the funnel on with `tailscale funnel --bg --yes --tls-terminated-tcp=<443|8443|10000>
   tcp://127.0.0.1:7339` (the first of those ports not used by another serve/funnel handler), reads it back from
   `tailscale funnel status --json`, and takes the public name from `tailscale status --json` (`Self.DNSName`).
   It rechecks every 10 minutes (every minute while Tailscale isn't running or signed in).
 - The away listener binds loopback only, so every connection on it came through the funnel (tailscaled dials
   `127.0.0.1`). No PROXY protocol is needed to tell funnel traffic apart. It never accepts pairing (§2.2) or
-  plaintext mode, and it caps unauthenticated handshakes in flight at 8.
+  plaintext mode, and it caps unauthenticated handshakes in flight at 16 (a new one drops the oldest).
 - TLS only gets the stream through the funnel. The client does not verify the certificate: Noise IK
   authenticates the PC by the key pinned at pairing, end to end, so a TLS man in the middle sees only Noise
   ciphertext. The 3DS (mbedTLS 2.28) offers ECDHE with X25519/P-256 and ChaCha20-Poly1305 first, then AES-GCM,
@@ -175,8 +177,8 @@ keeps what it has. The 3DS stores it in `sdmc:/3ds/hermes/server.json` as `"away
 After an away connection works, reconnects try the away route first as long as the 3DS's own IP address is
 unchanged. The status bar shows `LAN` or `AWAY`.
 
-Unpairing: `hermes 3ds devices` lists devices; `hermes 3ds unpair <name>` removes one. The 3DS can also
-forget a server from its settings.
+Unpairing: `hermes 3ds devices` lists devices; `hermes 3ds unpair <name>` removes one. On the 3DS, pairing
+with another server (SELECT) replaces the one it knew.
 
 ---
 
@@ -225,7 +227,8 @@ unknown fields are ignored.
 {"t":"error","id":7,"code":"bad_request","msg":"human-readable text"}
 ```
 
-Codes: `bad_request`, `not_paired`, `pair_lan_only` (§2.2), `version`, `busy`, `not_found`, `denied`, `too_large`, `internal`.
+Codes: `bad_request`, `not_paired`, `pair_lan_only` (§2.2), `version`, `not_found`, `denied`, `too_large`,
+`unavailable` (the PC can't do it right now, e.g. no desktop session or an older Hermes), `internal`.
 
 ### 4.2 Text content
 
@@ -249,9 +252,9 @@ whose delimiter row hasn't arrived) is held back so raw pipes never show.
 
 ```json
 // client → server (handshake msg 1 payload, or first frame in plaintext mode)
-{"t":"hello","v":1,"app":"3.0.0","device":"Random's 3DS","model":"old3ds",
+{"t":"hello","v":1,"app":"3ds-0.1.0","device":"Random's 3DS","model":"old3ds",
  "screen":{"top":[400,240],"bottom":[320,240]},
- "caps":["jpeg","png","pcm16","adpcm","emoji:7fa053d0"],
+ "caps":["emoji:7fa053d0","voiceq","speak"],
  "pair":"<base64url token, only when pairing>"}
 
 // server → client (handshake msg 2 payload)
@@ -264,8 +267,14 @@ whose delimiter row hasn't arrived) is held back so raw pipes never show.
 
 Version mismatch → `{"t":"error","code":"version","msg":"..."}` and close.
 
-`caps` lists what the app can display. `emoji:<set id>` says it has the colour emoji sprite set with that id
+`caps` lists what the app can display or do. `emoji:<set id>` says it has the colour emoji sprite set with that id
 (§6); without a matching one the server sends emoji as `:name:` text in every body, the welcome included.
+`voiceq` says it plays voice messages (§4.7 `voice`) one after another, so the server may send a spoken reply as
+several short ones while Hermes is still writing; without it a spoken reply is one message, sent when it is complete.
+`speak` says it plays `speak` events (§4.4): the server then sends a spoken reply's parts as those while Hermes
+writes, and the chat gets no voice message for it. It wins over `voiceq`.
+The server remembers the caps for as long as that connection lasts, and the last app's `speak` while none is
+connected (a reply spoken then is dropped, not kept for later).
 
 ### 4.4 Chat
 
@@ -291,6 +300,7 @@ Each paired device is one Hermes chat (`chat_id = "dev:<fingerprint>"`, DM). Her
 | `delete` | `mid` | Remove message `mid` (a streamed preview Hermes replaced, or one that held only a `MEDIA:` tag). Sent on reconnect if it happened while offline. |
 | `typing` | `on` | Agent turn running (`true`) / idle (`false`). The 3DS shows the braille spinner + thinking verb. |
 | `heard` | `req, text` | What Hermes' speech-to-text made of the voice message sent with request `req` (§4.4.1). |
+| `speak` | `speech, attach` | A part of a spoken reply, a few seconds of speech, sent while Hermes is still writing to an app with the `speak` cap (§4.3). `attach` is one voice attachment (§4.7); the app plays the parts in arrival order, each when the one before has ended, without showing them. Not kept for an offline device. The chat gets no voice message for a reply spoken this way. A reply Hermes speaks in one piece (no streaming) comes as a single `speak`. |
 | `tool` | `state, text?` | Tool activity from Hermes' live status: `state:"start"` with a phrase (e.g. `Running echo hi`) when a tool starts, `state:"done"` when it completes. The 3DS shows it as a terminal line with the braille spinner while running. |
 
 Streaming detail: Hermes streams by editing one message (~0.8 s cadence). The plugin strips Hermes'
@@ -369,8 +379,8 @@ Request/response pairs (`id` echoed). Lists take optional `offset`, `limit` (def
 | `sessions.messages` | `sid, limit?, before?` | `items:[{mid,role,text,spans?,tool?,ts}]`, oldest first; `before` = message id for paging back |
 | `sessions.resume` | `sid` | ack; the switch result arrives as a `msg` (kind `command`) |
 | `sessions.new` | `title?` | same |
-| `commands.list` | — | `items:[{name,desc,args,aliases}]` (gateway-visible + plugin + skill commands) |
-| `models.list` | — | `items:[{provider,name,models:[{id,label,current}]}]` |
+| `commands.list` | — | `items:[{name,desc,args,aliases}]`: Hermes' gateway slash commands, from a snapshot shipped with the plugin (`plugin/h3proto/hermes_commands.json`, made by `tools/build_commands.py`) |
+| `models.list` | — | `{items:[{provider,name,current,models:[{id,current}]}], model, provider}`: the models `config.yaml` names (default, `providers:`, `custom_providers:`, fallbacks); `current` follows a `/model` override |
 | `skills.list` | — | `items:[{name,desc,category,enabled}]` |
 | `tools.list` | — | `items:[{toolset,label,desc,enabled,tools:[...]}]` |
 | `jobs.list` | — | `items:[{id,name,schedule,state,next_run,last_run,last_status}]` |
@@ -423,7 +433,14 @@ Server → client: a `msg` may carry `attach`, a list of attachments. Its `text`
 - `{"t":"blob.open","id":n,"blob":"b3"}` → `blob.open_r`: the PC opens that original with its default app
   ("Open on PC"). Only `file` blobs can be opened.
 
-- `voice` (audio): `true` when Hermes sent the sound as a spoken reply (text-to-speech), not as a file.
+- `voice` (audio): `true` when Hermes sent the sound as a spoken reply (text-to-speech), not as a file. The 3DS
+  may play it as it arrives (the "Spoken replies" setting). With `voiceq` (§4.3) a reply can arrive as several
+  `voice` messages, a few seconds of speech each, the first as soon as Hermes has its first sentence; the app
+  plays them in arrival order, each when the one before has ended, and may start downloading the ones waiting.
+  A message id the app has already spoken (a replay after a reconnect) is not spoken again.
+- `speech` (audio, with `voice`): no longer sent; servers before 0.1.0 posted the whole of a reply spoken through
+  `speak` events (§4.4) as this message, with the parts' id here. An app that got parts with that id (played or
+  not) doesn't speak it again.
 
 Client → server: voice messages and photos, §4.4.1.
 

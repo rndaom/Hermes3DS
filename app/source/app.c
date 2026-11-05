@@ -11,6 +11,7 @@
 #include "codec.h"
 #include "log.h"
 #include "sfx.h"
+#include "speak.h"
 #include "store.h"
 #include "tabs.h"
 #include "ui.h"
@@ -278,28 +279,6 @@ void app_set_speak(bool on)
     app_toast(on ? "Spoken replies on" : "Spoken replies off");
 }
 
-// A new spoken reply (an audio attachment flagged voice, protocol.md §4.7): play it when that is wanted.
-static void autoplay(const json_t *msg)
-{
-    static char last[8][40];
-    static int next;
-    if (!app.settings.speak_replies || voice_active() || camera_is_open()) return;
-    json_t *attach = json_object_get(msg, "attach");
-    for (size_t i = 0; i < json_array_size(attach); i++) {
-        const json_t *a = json_array_get(attach, i);
-        if (!json_is_true(json_object_get(a, "voice")) || !audio_playable(a)) continue;
-        const char *id = jstr(json_object_get(a, "audio"), "id");
-        bool seen = false;
-        for (int k = 0; k < 8; k++) seen |= !strcmp(last[k], id);
-        if (seen) continue;  // a replayed message
-        snprintf(last[next], sizeof last[next], "%s", id);
-        next = (next + 1) % 8;
-        AudioStatus st;
-        if (!audio_status(a, &st) || !st.playing) audio_toggle(a);
-        return;
-    }
-}
-
 void app_compose(const char *initial)
 {
     char buf[3072];
@@ -322,14 +301,15 @@ static void stop_turn(void)
 
 static void approve(const char *choice)
 {
-    if (!app.chat.approval) return;
-    app_request("approve", json_pack("{s:s, s:s}", "req", jstr(app.chat.approval, "req"), "choice", choice));
+    if (!app.chat.approval || app.chat.prompt_req) return;  // one answer at a time
+    app.chat.prompt_req =
+        app_request("approve", json_pack("{s:s, s:s}", "req", jstr(app.chat.approval, "req"), "choice", choice));
 }
 
 static void answer_typed(void)
 {
     json_t *cl = app.chat.clarify;
-    if (!cl) return;
+    if (!cl || app.chat.prompt_req) return;
     int nch = clar_count();
     char buf[2432];
     const char *hint = !nch          ? "Your answer"
@@ -341,14 +321,15 @@ static void answer_typed(void)
     json_t *f = (nch && !clar_multi() && end != buf && *end == 0 && v >= 1 && v <= nch)
                     ? json_pack("{s:s, s:i}", "cid", jstr(cl, "cid"), "choice", (int)(v - 1))
                     : json_pack("{s:s, s:s}", "cid", jstr(cl, "cid"), "text", buf);
-    if (f) app_request("answer", f);
+    if (f && app.chat.clarify == cl) app.chat.prompt_req = app_request("answer", f);  // (still the same question)
+    else json_decref(f);
 }
 
 // Multi-select: send the ticked choices.
 static void answer_ticked(void)
 {
     json_t *cl = app.chat.clarify;
-    if (!cl || !clar_multi()) return;
+    if (!cl || !clar_multi() || app.chat.prompt_req) return;
     json_t *picks = json_array();
     for (int i = 0; i < clar_count() && i < 32; i++)
         if (app.chat.clar_sel >> i & 1) json_array_append_new(picks, json_integer(i));
@@ -357,20 +338,20 @@ static void answer_ticked(void)
         app_toast("Tick at least one, or type an answer");
         return;
     }
-    app_request("answer", json_pack("{s:s, s:o}", "cid", jstr(cl, "cid"), "choices", picks));
+    app.chat.prompt_req = app_request("answer", json_pack("{s:s, s:o}", "cid", jstr(cl, "cid"), "choices", picks));
 }
 
 // A on (or a tap of) choice i: answers a single-choice question, ticks a multi-select one.
 static void clar_pick(int i)
 {
     json_t *cl = app.chat.clarify;
-    if (!cl || i < 0 || i >= clar_count()) return;
+    if (!cl || i < 0 || i >= clar_count() || app.chat.prompt_req) return;
     app.chat.clar_cur = i;
     if (clar_multi()) {
         if (i < 32) app.chat.clar_sel ^= 1u << i;
         return;
     }
-    app_request("answer", json_pack("{s:s, s:i}", "cid", jstr(cl, "cid"), "choice", i));
+    app.chat.prompt_req = app_request("answer", json_pack("{s:s, s:i}", "cid", jstr(cl, "cid"), "choice", i));
 }
 
 // A question panel ignores A, X, Y and touches for its first PROMPT_ARM_MS: its rows lie where the input box
@@ -443,9 +424,20 @@ static void chat_touch(int x, int y)
         }
 }
 
+// A message that is only a spoken reply (voice audio, no text): the reply's text already played the reply sound.
+static bool spoken_only(const json_t *msg)
+{
+    const json_t *attach = json_object_get(msg, "attach");
+    if (jstr(msg, "text")[0] || !json_array_size(attach)) return false;
+    for (size_t i = 0; i < json_array_size(attach); i++)
+        if (!json_is_true(json_object_get(json_array_get(attach, i), "voice"))) return false;
+    return true;
+}
+
 const json_t *app_chat_audio(void)
 {
-    const json_t *newest = NULL;
+    const json_t *newest = speak_current();  // a reply being spoken has no bubble yet: Y pauses it
+    if (newest) return newest;
     AudioStatus s;
     for (int i = 0; i < app.chat.n; i++)
         for (size_t k = 0; k < json_array_size(app.chat.m[i]->attach); k++) {
@@ -587,6 +579,7 @@ void app_handle_event(NetEvent *ev)
         blob_on_chunk(ev);
         break;
     case NET_EV_STATE:
+        if (app.net == NET_ONLINE && ev->state != NET_ONLINE) chat_link_lost(&app.chat);
         app.net = ev->state;
         blob_online(ev->state == NET_ONLINE);
         upload_online(ev->state == NET_ONLINE);
@@ -603,6 +596,7 @@ void app_handle_event(NetEvent *ev)
         break;
     case NET_EV_WELCOME: {
         if (memcmp(ev->server.key, app.server.key, 32)) break;  // a late welcome from the PC before a re-pair
+        chat_reconnected(&app.chat);
         app.handshake_ms = ev->handshake_ms;
         app.route = ev->route;
         app.tls = ev->tls;
@@ -631,6 +625,10 @@ void app_handle_event(NetEvent *ev)
         if (blob_on_json(ev->json) || viewer_handle(ev->json)) break;  // blob transfers, Open on PC
         if (tabs_handle(ev->json)) break;                                // replies to the other tabs' requests
         const char *t = jstr(ev->json, "t");
+        if (!strcmp(t, "speak")) {  // a part of a spoken reply: played, not shown
+            speak_part(ev->json);
+            break;
+        }
         bool asking = app.chat.approval || app.chat.clarify;
         if (!strcmp(t, "status_r")) {
             double now = json_number_value(json_object_get(ev->json, "now"));
@@ -650,14 +648,15 @@ void app_handle_event(NetEvent *ev)
             }
         } else {
             chat_handle(&app.chat, ev->json);
-            if (!strcmp(t, "msg")) autoplay(ev->json);
+            if (!strcmp(t, "msg")) speak_arrive(ev->json);
         }
         if (app.chat.replied) {
             app.chat.replied = false;
-            if (!voice_active()) sfx_play(SFX_REPLY);  // not into the mic
+            if (!voice_active() && !spoken_only(ev->json)) sfx_play(SFX_REPLY);  // not into the mic
         }
         if (!asking && (app.chat.approval || app.chat.clarify)) {  // Hermes is waiting: show the question
             viewer_close();
+            if (camera_is_open()) app_toast("Camera closed: Hermes is asking you something");
             camera_close();
             if (app.tab != TAB_CHAT) tabs_switch(TAB_CHAT);
             sfx_play(SFX_ATTENTION);
@@ -753,12 +752,13 @@ void app_init(void)
 void app_exit(void)
 {
     voice_exit();
-    camera_close();
+    camera_exit();
     upload_exit();
     for (int k = 0; k < MEDIA_MAX; k++) {
         json_decref(media[k].fields);
         free(media[k].text);
     }
+    speak_exit();  // before audio_exit: its prefetches are blob streams
     sfx_exit();    // before audio_exit: both use the DSP
     audio_exit();  // before blob_exit: it closes its stream
     blob_exit();

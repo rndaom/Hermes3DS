@@ -2,12 +2,14 @@
 welcome / status / `away` events, the Tailscale CLI wrapper and the AwayManager loop."""
 
 import asyncio
+import importlib
 import json
 
 import pytest
 
 from h3proto import tailscale
-from h3proto.away import AwayManager, DISABLED_FILE, parse_address, parse_mode, read_status
+from h3proto.away import (AwayManager, DISABLED_FILE, ENABLED_FILE, effective_mode, parse_address, parse_mode,
+                          read_status)
 from h3proto.client import Client, ServerError
 from h3proto.noise import KeyPair
 from h3proto.pairing import DeviceStore, TokenStore
@@ -128,18 +130,22 @@ async def test_away_in_welcome(server):
     await c.close()
 
 
-async def test_away_listener_bounds_pending_handshakes(away_server):
+async def test_away_listener_bounds_pending_handshakes_dropping_the_oldest(away_server):
     srv = away_server
-    socks = []
+    socks, readers = [], []
     for _ in range(AWAY_MAX_HANDSHAKES):
         r, w = await asyncio.open_connection("127.0.0.1", srv.away_port)
         socks.append(w)
+        readers.append(r)
     for _ in range(50):
-        if srv._away_handshakes >= AWAY_MAX_HANDSHAKES:
+        if len(srv._away_pending) >= AWAY_MAX_HANDSHAKES:
             break
         await asyncio.sleep(0.02)
+    # One more: the oldest idle socket makes way (closed at once), the newcomer gets its chance.
     r, w = await asyncio.open_connection("127.0.0.1", srv.away_port)
-    assert await asyncio.wait_for(r.read(), 2) == b""  # closed at once
+    assert await asyncio.wait_for(readers[0].read(), 2) == b""
+    await asyncio.sleep(0.05)
+    assert len(srv._away_pending) == AWAY_MAX_HANDSHAKES and not r.at_eof()
     w.close()
     for w in socks:
         w.close()
@@ -282,7 +288,8 @@ def test_find_cli_default_windows_path(monkeypatch, tmp_path):
 # --- config parsing and the manager ---------------------------------------------
 
 def test_parse_mode_and_address():
-    assert parse_mode(None) == "auto" and parse_mode("OFF") == "off" and parse_mode(True) == "on"
+    assert parse_mode(None) == "" and parse_mode("") == "" and parse_mode("OFF") == "off" and parse_mode(True) == "on"
+    assert parse_mode("auto") == "auto"
     assert parse_address("example.com:8443") == {"host": "example.com", "port": 8443}
     assert parse_address("example.com") == {"host": "example.com", "port": 443}
     assert parse_address("") is None and parse_address("x:99999") is None and parse_address("x:abc") is None
@@ -340,3 +347,42 @@ async def test_manager_manual_address(tmp_path):
                     find_cli=lambda: pytest.fail("no Tailscale lookup"))
     assert await m.once() is None
     assert srv.sent == [{"host": "tunnel.example.com", "port": 443}]
+
+
+def test_away_is_opt_in(tmp_path):
+    addr = {"host": "tunnel.example.com", "port": 443}
+    assert effective_mode("", tmp_path, None) == "off"  # nothing asked for: no Funnel, no listener
+    assert effective_mode("", tmp_path, addr) == "on"
+    assert effective_mode("auto", tmp_path, None) == "auto" and effective_mode("on", tmp_path, None) == "on"
+    (tmp_path / ENABLED_FILE).write_text("on")
+    assert effective_mode("", tmp_path, None) == "on"
+    assert effective_mode("off", tmp_path, None) == "off"  # the config's `off` beats the CLI
+    (tmp_path / DISABLED_FILE).write_text("off")
+    assert effective_mode("on", tmp_path, addr) == "off"  # `hermes 3ds away off` beats the config
+
+
+def test_cli_away_on_and_off(tmp_path, monkeypatch, capsys):
+    cli = importlib.import_module("plugin.cli")
+    ts = importlib.import_module("plugin.h3proto.tailscale")  # the copy cli.py imports
+    calls = []
+    monkeypatch.setattr(ts, "ensure_funnel", lambda port, **k: calls.append(("on", port))
+                        or tailscale.FunnelResult(True, DNS, 443))
+    monkeypatch.setattr(ts, "disable_funnel", lambda port, **k: calls.append(("off", port))
+                        or tailscale.FunnelResult(True))
+    monkeypatch.setattr(ts, "find_cli", lambda: None)
+    monkeypatch.setattr(cli, "_listening", lambda port: False)
+    config = {}
+    monkeypatch.setattr(cli, "_platform_config", lambda: config)
+    monkeypatch.delenv("THREEDS_AWAY", raising=False)
+    monkeypatch.delenv("THREEDS_AWAY_ADDRESS", raising=False)
+
+    assert "install Tailscale and run `hermes 3ds away on`" in cli.away_summary(tmp_path)
+    assert cli._away("on", tmp_path) == 0 and calls == [("on", 7339)]
+    assert (tmp_path / ENABLED_FILE).exists() and "restart" in capsys.readouterr().out
+    assert cli._away_mode(tmp_path) == "on"
+    assert cli._away("off", tmp_path) == 0 and calls[-1] == ("off", 7339)
+    assert not (tmp_path / ENABLED_FILE).exists() and cli._away_mode(tmp_path) == "off"
+    assert "turned off" in cli.away_summary(tmp_path)
+    config["away"] = "off"
+    calls.clear()
+    assert cli._away("on", tmp_path) == 1 and calls == []  # `away: off` in the config: Tailscale untouched

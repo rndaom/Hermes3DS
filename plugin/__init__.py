@@ -22,8 +22,11 @@ def is_connected(config) -> bool:
 
 
 def register(ctx):
+    from . import compat
     from .adapter import ThreeDSAdapter
     from .cli import handle_cli, setup_cli
+
+    compat.bind(ctx)  # the jobs tab calls Hermes' cron tool through the plugin context
 
     ctx.register_platform(
         name="3ds",
@@ -47,8 +50,14 @@ def register(ctx):
             "plays on the 3DS, text/code/PDF/documents open in a reader, everything else becomes a "
             "downloadable card. Image URLs via ![alt](url) are sent as images too. When the user asks "
             "you to send, show, attach or play a file, create or find it, then attach it this way; "
-            "never tell them to open it on the PC instead."),
+            "never tell them to open it on the PC instead. "
+            "Photos from this chat come from the 3DS camera: 640x480 (0.3 MP), often soft or dim, and "
+            "screens photographed with it show moire. Answer from the photo as it is, in one look: don't "
+            "crop, zoom, upscale or re-analyze it with tools, and if a detail is too small to read, say so "
+            "and ask for a closer photo."),
     )
+    from .speech import register_provider
+    register_provider(ctx)  # streaming spoken replies (speech.py); inert until tts.streaming.provider names it
     ctx.register_cli_command(
         name="3ds", help="Pair and manage Nintendo 3DS devices",
         description="Pair a Nintendo 3DS with this PC and manage paired devices.",

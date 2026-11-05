@@ -1,4 +1,9 @@
-"""Every read of Hermes internals lives here (protocol.md §4.6), so upstream churn breaks one file.
+"""Every read of Hermes' state lives here (protocol.md §4.6), so upstream churn breaks one file.
+
+Only public Hermes surfaces are used (the plugin catalog's rule 9): `hermes_state.SessionDB`, the runner's
+session store, `hermes_cli.config`, `tools.skills_tool`, `tools.registry` and the `cronjob_manage` tool through
+the plugin context. Where Hermes has no public API yet (its command catalog, the model picker's provider
+inventory, toolset labels) the 3DS gets a simpler view built from those.
 
 Each function runs blocking Hermes code via asyncio.to_thread where needed and returns plain JSON-able
 data for the 3DS. Failures raise RequestError("unavailable", ...) instead of crashing the connection.
@@ -9,14 +14,25 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import functools
-import inspect
+import json
 import logging
+import threading
+from pathlib import Path
 from typing import Any
 
 from .h3proto.emoji import emoji_for_3ds
 from .h3proto.server import RequestError
 
 log = logging.getLogger("hermes3ds")
+
+_ctx: Any = None  # the PluginContext register() got; tools are dispatched through it
+_db: Any = None
+_db_lock = threading.Lock()
+
+
+def bind(ctx: Any) -> None:
+    global _ctx
+    _ctx = ctx
 
 
 def _guard(fn):
@@ -32,11 +48,20 @@ def _guard(fn):
     return wrapper
 
 
-def _raw_db(runner):
-    db = getattr(runner, "_session_db", None)
-    if db is None:
-        raise RequestError("unavailable", "session database not available")
-    return getattr(db, "_db", db)
+def _session_db():
+    """Hermes' session database, opened read-only once (the gateway keeps its own writer)."""
+    global _db
+    with _db_lock:
+        if _db is None:
+            from hermes_state import SessionDB
+            _db = SessionDB(read_only=True)
+        return _db
+
+
+def _config() -> dict[str, Any]:
+    from hermes_cli.config import load_config
+    cfg = load_config()
+    return cfg if isinstance(cfg, dict) else {}
 
 
 def _ts(value: Any) -> float | None:
@@ -67,21 +92,16 @@ async def current_session(runner, source) -> dict[str, Any]:
 
 
 @_guard
-async def status(runner, source, busy: bool) -> dict[str, Any]:
+async def status(runner, source, busy: bool, queued: int = 0) -> dict[str, Any]:
+    """`queued` is the adapter's count of messages waiting behind the current turn."""
     cur = await current_session(runner, source)
-    db = _raw_db(runner)
+    db = _session_db()
     row = await asyncio.to_thread(db.get_session, cur["id"]) or {}
     try:
         title = await asyncio.to_thread(db.get_session_title, cur["id"])
     except Exception:
         title = row.get("title")
-    key = cur["key"]
-    queued = 0
-    model = _live_model(runner, key) or row.get("model") or ""
-    try:
-        queued = int(runner._queue_depth(key) or 0)
-    except Exception:
-        pass
+    model = await _live_model(runner, cur["key"]) or row.get("model") or ""
     return {
         "session": {
             "id": cur["id"], "title": emoji_for_3ds(title or ""), "model": model,
@@ -89,34 +109,48 @@ async def status(runner, source, busy: bool) -> dict[str, Any]:
             "tokens_in": row.get("input_tokens") or 0, "tokens_out": row.get("output_tokens") or 0,
             "cost": row.get("actual_cost_usd") or row.get("estimated_cost_usd") or 0,
         },
-        "busy": busy, "queued": queued,
+        "busy": busy, "queued": max(0, int(queued or 0)),
     }
 
 
-def _live_model(runner, key: str) -> str:
+def _current_model(cfg: dict[str, Any]) -> tuple[str, str]:
+    """`(model, provider)` from `model:` in config.yaml (a string or a dict)."""
+    m = cfg.get("model")
+    if isinstance(m, dict):
+        return str(m.get("default") or m.get("model") or ""), str(m.get("provider") or "")
+    return str(m or ""), ""
+
+
+async def _override(runner, key: str) -> dict[str, Any]:
+    """The session's /model override (`{model, provider, ...}`), or {}."""
+    with contextlib.suppress(Exception):
+        ov = await runner.async_session_store.get_model_override(key)
+        if isinstance(ov, dict):
+            return ov
+    return {}
+
+
+async def _live_model(runner, key: str) -> str:
     """The model the next turn will use: the session's /model override, else the configured default.
     The session row only records the model the session started with."""
+    ov = await _override(runner, key)
+    if ov.get("model"):
+        return str(ov["model"])
     with contextlib.suppress(Exception):
-        override = runner._session_model_override(key)
-        if override and override.get("model"):
-            return str(override["model"])
-    with contextlib.suppress(Exception):
-        from hermes_cli.config import load_config
-        m = load_config().get("model") or {}
-        return str(m.get("default") or m.get("model") or "") if isinstance(m, dict) else str(m)
+        return _current_model(await asyncio.to_thread(_config))[0]
     return ""
 
 
 @_guard
 async def sessions_list(runner, source, offset: int, limit: int, q: str | None) -> list[dict]:
-    from hermes_cli.session_listing import query_session_listing
     cur = await current_session(runner, source)
+    search = (q or "").strip() or None
+    # This chat's lane only (session_key), unnamed sessions included, newest activity first when searching.
     rows = await asyncio.to_thread(
-        query_session_listing, _raw_db(runner), source=source.platform.value, session_key=cur["key"],
-        current_session_id=cur["id"], include_current_session=True, include_unnamed=True,
-        search_query=q or None, limit=offset + limit)
+        _session_db().list_sessions_rich, source=source.platform.value, session_key=cur["key"],
+        search_query=search, order_by_last_active=bool(search), limit=limit, offset=offset)
     items = []
-    for r in rows[offset:offset + limit]:
+    for r in rows:
         items.append({
             "id": r.get("id"), "title": _clip(r.get("title") or "", 80), "preview": _clip(r.get("preview"), 120),
             "last_active": _ts(r.get("last_active") or r.get("started_at")),
@@ -125,24 +159,18 @@ async def sessions_list(runner, source, offset: int, limit: int, q: str | None) 
     return items
 
 
-async def _visible(runner, source, row: dict | None) -> bool:
-    if not row:
-        return False
-    check = getattr(runner, "_resume_row_visible", None)
-    if check is None:
-        return row.get("source") == source.platform.value
-    seen = check(source, row, allow_all=False)
-    if inspect.isawaitable(seen):  # async since Hermes 0.22; bool(coroutine) would let every row through
-        seen = await seen
-    return bool(seen)
+def _visible(row: dict | None, key: str) -> bool:
+    """Whether this chat may read a session: only sessions of its own lane, as in the session list."""
+    return bool(row) and row.get("session_key") == key
 
 
 @_guard
 async def session_messages(runner, source, sid: str, limit: int, before: int | None) -> list[dict]:
     from .h3proto.richtext import markdown_to_rich
-    db = _raw_db(runner)
+    cur = await current_session(runner, source)
+    db = _session_db()
     row = await asyncio.to_thread(db.get_session, sid)
-    if not await _visible(runner, source, row):
+    if not _visible(row, cur["key"]):
         raise RequestError("not_found", "no such session for this device")
     resolved = await asyncio.to_thread(db.resolve_resume_session_id, sid)
     msgs = await asyncio.to_thread(db.get_messages, resolved or sid, latest=True, include_ancestors=True,
@@ -173,82 +201,94 @@ async def session_messages(runner, source, sid: str, limit: int, before: int | N
 
 # --- catalogs -------------------------------------------------------------------
 
+@functools.lru_cache(maxsize=1)
+def _builtin_commands() -> tuple[dict, ...]:
+    """Hermes' gateway slash commands, a snapshot built by tools/build_commands.py (no public catalog API yet)."""
+    path = Path(__file__).with_name("h3proto") / "hermes_commands.json"
+    return tuple(json.loads(path.read_text(encoding="utf-8")))
+
+
 @_guard
 async def commands_list() -> list[dict]:
-    from hermes_cli import commands as c
-    gate = getattr(c, "_is_gateway_available", None)
-    items = []
-    for cmd in c.COMMAND_REGISTRY:
-        if gate is not None:
-            if not gate(cmd):
-                continue
-        elif getattr(cmd, "cli_only", False):
-            continue
-        desc = cmd.describe() if hasattr(cmd, "describe") else getattr(cmd, "description", "")
-        items.append({"name": cmd.name, "desc": _clip(desc, 120), "args": getattr(cmd, "args_hint", "") or "",
-                      "aliases": list(getattr(cmd, "aliases", ()) or ())})
-    try:
-        from hermes_cli.plugins import get_plugin_commands
-        for name, info in (get_plugin_commands() or {}).items():
-            items.append({"name": name, "desc": _clip((info or {}).get("description", ""), 120),
-                          "args": (info or {}).get("args_hint", "") or "", "aliases": []})
-    except Exception:
-        log.debug("3ds: plugin commands unavailable", exc_info=True)
-    return items
+    return [{"name": c["name"], "desc": _clip(c.get("desc"), 120), "args": c.get("args") or "",
+             "aliases": list(c.get("aliases") or [])} for c in _builtin_commands()]
+
+
+def _model_options(cfg: dict[str, Any], override: dict[str, Any]) -> dict:
+    """The models config.yaml names, grouped by provider: the current one, `providers:` entries and their
+    models, `custom_providers:` and the fallback chain. (Hermes' full picker inventory is not public yet.)"""
+    default_model, default_provider = _current_model(cfg)
+    model = str(override.get("model") or default_model)
+    provider = str(override.get("provider") or default_provider)
+    if provider.lower() == "auto":
+        provider = ""
+    groups: dict[str, dict] = {}
+
+    def add(slug: Any, name: Any, mid: Any) -> None:
+        slug, mid = str(slug or "").strip(), str(mid or "").strip()
+        if not slug or not mid:
+            return
+        group = groups.setdefault(slug, {"provider": slug, "name": str(name or slug), "models": []})
+        if mid not in group["models"]:
+            group["models"].append(mid)
+
+    add(provider, "", model)
+    if default_provider.lower() != "auto":
+        add(default_provider, "", default_model)  # after a /model switch, the configured default stays pickable
+    providers = cfg.get("providers")
+    for key, entry in (providers.items() if isinstance(providers, dict) else ()):
+        if isinstance(entry, dict):
+            models = entry.get("models")
+            names = list(models) if isinstance(models, (dict, list)) else []
+            for mid in [entry.get("default_model") or entry.get("model"), *names]:
+                add(key, entry.get("name"), mid if isinstance(mid, str) else (mid or {}).get("id"))
+    for entry in (cfg.get("custom_providers") or []) if isinstance(cfg.get("custom_providers"), list) else ():
+        if isinstance(entry, dict) and str(entry.get("name") or "").strip():
+            add(f"custom:{str(entry['name']).strip().lower()}", entry["name"], entry.get("model"))
+    for key in ("fallback_providers", "fallback_model"):
+        chain = cfg.get(key)
+        for entry in ([chain] if isinstance(chain, dict) else chain if isinstance(chain, list) else []):
+            if isinstance(entry, dict):
+                add(entry.get("provider"), "", entry.get("model"))
+    items = [{"provider": g["provider"], "name": g["name"], "current": g["provider"] == provider,
+              "models": [{"id": m, "current": g["provider"] == provider and m == model} for m in g["models"]][:40]}
+             for g in groups.values()]
+    return {"items": items, "model": model, "provider": provider}
 
 
 @_guard
-async def models_list() -> dict:
-    from hermes_cli.inventory import build_model_options_payload, load_picker_context
-
-    def build():
-        return build_model_options_payload(load_picker_context(), include_unconfigured=False, refresh=False)
-
-    payload = await asyncio.to_thread(build)
-    cur_model, cur_provider = payload.get("model"), payload.get("provider")
-    providers = []
-    for p in payload.get("providers") or []:
-        providers.append({
-            "provider": p.get("slug"), "name": p.get("name"), "current": bool(p.get("is_current")),
-            "models": [{"id": m, "current": bool(p.get("is_current")) and m == cur_model}
-                       for m in (p.get("models") or [])][:40],
-        })
-    return {"items": providers, "model": cur_model, "provider": cur_provider}
+async def models_list(runner=None, key: str | None = None) -> dict:
+    override = await _override(runner, key) if runner is not None and key else {}
+    return _model_options(await asyncio.to_thread(_config), override)
 
 
 @_guard
 async def skills_list() -> list[dict]:
-    from tools import skills_tool
-
-    # Public names since Hermes 0.22; the underscored ones before.
-    find_all = getattr(skills_tool, "find_all_skills", None) or skills_tool._find_all_skills
-    sort = getattr(skills_tool, "sort_skills", None) or skills_tool._sort_skills
+    from tools.skills_tool import find_all_skills, sort_skills
 
     def build():
-        everything = find_all(skip_disabled=True)
-        enabled = {s["name"] for s in find_all()}
+        everything = find_all_skills(skip_disabled=True)
+        enabled = {s["name"] for s in find_all_skills()}
         return [{"name": s["name"], "desc": _clip(s.get("description"), 160), "category": s.get("category") or "",
-                 "enabled": s["name"] in enabled} for s in sort(everything)]
+                 "enabled": s["name"] in enabled} for s in sort_skills(everything)]
 
     return await asyncio.to_thread(build)
 
 
 @_guard
 async def tools_list(platform: str) -> list[dict]:
-    from hermes_cli.config import load_config
-    from hermes_cli import tools_config as tc
-    import toolsets
+    from tools.registry import registry
 
     def build():
-        enabled = tc._get_platform_tools(load_config(), platform)
+        chosen = (_config().get("platform_toolsets") or {}).get(platform)
+        chosen = {str(n) for n in chosen} if isinstance(chosen, list) else None  # None: Hermes' platform default
         out = []
-        for name, label, desc in tc._get_effective_configurable_toolsets():
-            try:
-                tools = list(toolsets.resolve_toolset(name))
-            except Exception:
-                tools = []
-            out.append({"toolset": name, "label": label, "desc": _clip(desc, 120), "enabled": name in enabled,
-                        "tools": tools[:40]})
+        for name, info in sorted(registry.get_available_toolsets().items()):
+            available = bool(info.get("available", True))
+            out.append({"toolset": name, "label": name.replace("_", " ").replace("-", " "),
+                        "desc": _clip(info.get("description"), 120),
+                        "enabled": available and (chosen is None or name in chosen),
+                        "tools": list(info.get("tools") or [])[:40]})
         return out
 
     return await asyncio.to_thread(build)
@@ -258,27 +298,39 @@ def _job(j: dict) -> dict:
     sched = j.get("schedule")
     if isinstance(sched, dict):
         sched = sched.get("display") or sched.get("expr")
-    return {"id": j.get("id"), "name": j.get("name") or _clip(j.get("prompt"), 40),
+    return {"id": j.get("job_id") or j.get("id"), "name": j.get("name") or _clip(j.get("prompt_preview"), 40),
             "schedule": _clip(j.get("schedule_display") or sched, 60),
             "state": j.get("state") or ("scheduled" if j.get("enabled") else "paused"),
             "next_run": _ts(j.get("next_run_at")), "last_run": _ts(j.get("last_run_at")),
             "last_status": j.get("last_status"), "last_error": _clip(j.get("last_error"), 200) or None}
 
 
+def _cron(args: dict[str, Any]) -> dict[str, Any]:
+    """One `cronjob_manage` call (Hermes' cron tool) through the plugin context. Blocking."""
+    if _ctx is None:
+        raise RequestError("unavailable", "cron unavailable (plugin context not bound)")
+    out = json.loads(_ctx.dispatch_tool("cronjob_manage", args))
+    if not isinstance(out, dict):
+        raise RequestError("unavailable", "unexpected reply from the cron tool")
+    if out.get("success") is False or out.get("error"):
+        err = str(out.get("error") or out.get("message") or "cron tool failed")
+        raise RequestError("not_found" if "not found" in err.lower() else "unavailable", err)
+    return out
+
+
 @_guard
 async def jobs_list() -> list[dict]:
-    from cron import jobs
-    return [_job(j) for j in await asyncio.to_thread(jobs.list_jobs, include_disabled=True)]
+    out = await asyncio.to_thread(_cron, {"action": "list", "include_disabled": True})
+    return [_job(j) for j in out.get("jobs") or [] if isinstance(j, dict)]
 
 
 @_guard
 async def jobs_action(job_id: str, op: str) -> dict:
-    from cron import jobs
-    fn = {"pause": jobs.pause_job, "resume": jobs.resume_job, "run": jobs.trigger_job}.get(op)
-    if fn is None:
+    if op not in ("pause", "resume", "run"):
         raise RequestError("bad_request", "op must be pause, resume or run")
-    result = await asyncio.to_thread(fn, job_id)
-    if not result:
-        raise RequestError("not_found", "no such job")
-    job = await asyncio.to_thread(jobs.get_job, job_id)
-    return _job(job or {"id": job_id})
+    args: dict[str, Any] = {"action": op, "job_id": job_id}
+    if op == "pause":
+        args["reason"] = "Paused from the Nintendo 3DS"
+    out = await asyncio.to_thread(_cron, args)  # `run` hands the job to the background and returns at once
+    job = out.get("job") if isinstance(out.get("job"), dict) else out
+    return _job(job if job.get("job_id") or job.get("id") else {"id": job_id})

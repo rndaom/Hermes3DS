@@ -46,6 +46,7 @@ typedef struct {
 
 static struct {
     bool open;
+    const json_t *sel_a;  // the selected attachment (only compared, never read: it may have been freed)
     char sel_mid[32];
     int sel_att;
     int zoom;        // 0 = FIT, else ZOOMS[zoom - 1]
@@ -97,7 +98,9 @@ int files_count(void)
 // Index of the selected file in files[] (the selection follows its message as the transcript changes).
 static int sel_index(void)
 {
-    for (int i = 0; i < nfiles; i++)
+    for (int i = 0; i < nfiles; i++)  // your own photos and voice messages have no mid: match the attachment
+        if (files[i].a == v.sel_a) return i;
+    for (int i = 0; i < nfiles && v.sel_mid[0]; i++)  // a message whose attachments were replaced by an edit
         if (!strcmp(files[i].m->mid, v.sel_mid) && json_array_get(files[i].m->attach, (size_t)v.sel_att) == files[i].a)
             return i;
     return nfiles ? nfiles - 1 : -1;
@@ -189,6 +192,7 @@ static void reader_scroll(float dy)
 static void select_file(int i)
 {
     if (i < 0 || i >= nfiles) return;
+    v.sel_a = files[i].a;
     snprintf(v.sel_mid, sizeof v.sel_mid, "%s", files[i].m->mid);
     v.sel_att = 0;
     for (size_t k = 0; k < json_array_size(files[i].m->attach); k++)
@@ -663,7 +667,7 @@ void viewer_draw_top(void)
     spaced(buf, INFO_X, y, S_EYE, COL_BLUE, 1.6f);
     y += 11;
     clock_text(f->m->local_time, when, sizeof when);
-    snprintf(buf, sizeof buf, "FROM HERMES%s%s", when[0] ? " · " : "", when);
+    snprintf(buf, sizeof buf, "FROM %s%s%s", f->m->role == R_USER ? "YOU" : "HERMES", when[0] ? " · " : "", when);
     spaced(buf, INFO_X, y, S_EYE, COL_TX_3, 1.2f);
     y += 13;
     y += text_block(js(f->a, "name"), INFO_X, y, INFO_W, S_BODY, &BODY_COLORS, 2, NULL) + 2;

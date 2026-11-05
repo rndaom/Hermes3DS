@@ -9,7 +9,13 @@ First public release.
 - Sessions, skills, jobs, model picker and slash-command grid.
 - Pictures, document reader (text, Markdown, code, PDF, Office), audio player; Save to SD; Open on PC.
 - Voice messages (hold Y), camera photos, spoken replies, UI sounds.
-- Pairing by code with fingerprint check; LAN discovery and call-back; away from home through Tailscale Funnel.
+- Pairing by code with fingerprint check; LAN discovery and call-back; away from home through Tailscale Funnel
+  (opt-in: `hermes 3ds away on`).
 - HOME Menu icon, banner and `.cia` build.
+- Spoken replies are synthesized sentence by sentence while the model writes (`piper-stream`, optional), and the 3DS
+  starts speaking within a second or two of the first sentence. Spoken replies are heard, not posted as voice
+  messages; the 3DS header shows VOICE while Spoken replies is on.
 - `3ds` platform plugin for the Hermes gateway: Noise IK listener, media transcoding, `hermes 3ds pair |
-  devices | unpair | away`.
+  devices | unpair | away`. Uses only public Hermes interfaces; needs Hermes Agent 0.22.5 or newer.
+- Reliable across restarts and dropped links: message ids stay unique after a gateway restart, a reconnect replays
+  what the 3DS may have missed, unsent messages show NOT SENT, and stale approval or question panels clear.

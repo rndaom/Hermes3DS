@@ -203,7 +203,7 @@ void audio_toggle(const json_t *a)
 {
     if (!audio_playable(a)) return;
     if (!audio_dsp_ready()) {
-        app_toast("Audio needs the DSP firmware: run DSP1 once");
+        app_toast("Audio needs the DSP firmware: dump it in Rosalina");
         return;
     }
     if (!is_current(a)) load(a);
@@ -214,6 +214,20 @@ void audio_toggle(const json_t *a)
                (unsigned long)au.total);
     app.dirty = true;
     audio_tick();  // start filling now, not a frame later
+}
+
+void audio_prefetch(const json_t *a)
+{
+    BlobRef r;
+    if (!audio_playable(a) || !blob_ref_parse(json_object_get(a, "audio"), &r) || is_current(a)) return;
+    blob_stream(&r, NULL);  // a running or finished stream just stays fresh
+}
+
+void audio_forget(const json_t *a)
+{
+    BlobRef r;
+    if (!blob_ref_parse(json_object_get(a, "audio"), &r) || is_current(a)) return;
+    blob_stream_release(r.id);
 }
 
 void audio_seek(float seconds)

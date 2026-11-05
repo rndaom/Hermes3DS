@@ -513,10 +513,11 @@ static void sessions_input(u32 down, u32 held, const touchPosition *t)
         else if (list_tap(LS_SESSIONS, t, SESS_Y, SESS_ROWS)) resume_selected();
         else want_preview();
     }
-    if (preview_due && osGetTime() >= preview_due) {
+    // While an earlier preview is still on its way, wait for it (its reply is dropped if the selection moved on)
+    // and then fetch this one.
+    if (preview_due && osGetTime() >= preview_due && !lists[LS_PREVIEW].req) {
         preview_due = 0;
-        if (preview_sid[0] && !lists[LS_PREVIEW].req)
-            fetch(LS_PREVIEW, json_pack("{s:s, s:i}", "sid", preview_sid, "limit", 8));
+        if (preview_sid[0]) fetch(LS_PREVIEW, json_pack("{s:s, s:i}", "sid", preview_sid, "limit", 8));
     }
 }
 
@@ -592,7 +593,7 @@ static void draw_preview(float y0, float y1)
             text_draw_fit(text, PAD_X + 30, y + 0.5f, S_TOOL, COL_TX_2, AW - 16);
         } else {
             frame_rect(PAD_X, y, 15, 15, COL_LINE_B);
-            wing_mark(PAD_X + 3, y + 3, COL_BLUE);
+            hermes_mark(PAD_X + 3, y + 3, COL_BLUE);
             text_block(text, PAD_X + 22, y, AW, S_SMALL, &BODY_COLORS, 3, NULL);
         }
         y += mh + GAP;

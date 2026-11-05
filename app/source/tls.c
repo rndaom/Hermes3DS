@@ -1,5 +1,7 @@
 #include "tls.h"
 
+#include "conn.h"  // conn_abort
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -157,14 +159,15 @@ int tls_open(Tls **out, sock_t fd, const char *sni, int timeout_ms, TlsInfo *inf
             goto fail;
         }
         uint64_t now = plat_ms();
-        if (now >= deadline) {
+        if (now >= deadline || conn_abort) {
             snprintf(err, errlen, "TLS handshake timed out");
             t->io_failed = 1;
             goto fail;
         }
         struct pollfd p = {.fd = fd, .events = r == MBEDTLS_ERR_SSL_WANT_READ ? POLLIN : POLLOUT, .revents = 0};
-        if (sock_poll(&p, 1, (int)(deadline - now)) < 0 && sock_errno() != SOCK_EINTR) {
-            snprintf(err, errlen, "TLS handshake: socket error");
+        int left = (int)(deadline - now);
+        if (sock_poll(&p, 1, left < 200 ? left : 200) < 0 && sock_errno() != SOCK_EINTR) {
+            snprintf(err, errlen, "TLS handshake: socket error (errno %d)", sock_errno());
             t->io_failed = 1;
             goto fail;
         }

@@ -71,7 +71,14 @@ bool json_depth_ok(const char *s, size_t n)
 
 static void emit(NetEvent *ev)
 {
-    while (!queue_push(&events, ev)) svcSleepThread(10 * 1000000LL);  // UI busy (e.g. swkbd open): wait, never drop
+    // UI busy (e.g. swkbd open): wait, never drop, unless the app is closing and nobody will read it.
+    while (!queue_push(&events, ev)) {
+        if (conn_abort) {
+            net_event_free(ev);
+            return;
+        }
+        svcSleepThread(10 * 1000000LL);
+    }
 }
 
 // NULL when out of memory (logged): the caller drops the event.
@@ -139,6 +146,8 @@ static json_t *hello_json(const uint8_t *pair_token, size_t token_len)
                           "bottom", 320, 240, "caps");
     const char *emoji = emoji_cap();  // the plugin sends colour emoji only to an app with its sprite set
     if (emoji) json_array_append_new(json_object_get(h, "caps"), json_string(emoji));
+    json_array_append_new(json_object_get(h, "caps"), json_string("voiceq"));  // plays voice messages one after another
+    json_array_append_new(json_object_get(h, "caps"), json_string("speak"));   // plays `speak` events (spoken parts)
     if (pair_token) {
         char b64[64];
         b64u_encode(pair_token, token_len, b64);
@@ -394,10 +403,15 @@ static bool online_command(Cmd *c)
     switch (c->kind) {
     case CMD_DISCONNECT: want_online = false; return false;
     case CMD_WAKE: return false;  // the socket did not survive sleep; reconnect
-    case CMD_CONNECT:
+    case CMD_CONNECT: {
+        // Already connected to exactly this PC (the app asks again right after pairing): keep the connection.
+        bool same = !memcmp(c->server.key, target.key, 32) && !strcmp(c->server.host, target.host) &&
+                    c->server.port == target.port && !strcmp(c->server.away_host, target.away_host) &&
+                    c->server.away_port == target.away_port;
         target = c->server;
         want_online = true;
-        return false;
+        return same;
+    }
     case CMD_QUIT: want_online = false; return false;
     case CMD_PAIR:
         conn_close(&conn);
@@ -553,7 +567,7 @@ static int connect_routes(json_t **reply, uint32_t *ms, NetRoute *used)
         order[1] = ROUTE_LAN;
     }
     int rc = CONN_ERR_CONNECT;
-    for (int i = 0; i < n; i++) {
+    for (int i = 0; i < n && !conn_abort; i++) {
         emit_state(NET_CONNECTING, 0, order[i] == ROUTE_AWAY ? target.away_host : target.host);
         u64 t0 = osGetTime();
         rc = open_session(&target, order[i], NULL, 0, reply, ms);
@@ -615,7 +629,7 @@ static bool idle_wait(int ms)
 static void worker(void *arg)
 {
     int failures = 0;
-    while (!quit_requested) {
+    while (!quit_requested && !conn_abort) {
         if (!want_online) {
             emit_state(NET_OFFLINE, 0, NULL);
             while (!want_online && !quit_requested) idle_wait(-1);
@@ -665,6 +679,7 @@ static void worker(void *arg)
         failures++;
         log_printf("connect %s:%u%s failed: %s", target.host, target.port, has_away(&target) ? " (and away)" : "",
                    conn_err_text(rc));
+        if (conn_abort) break;
         if (failures % 3 == 0 && find_moved_server()) continue;
         int wait_s = BACKOFF[failures - 1 < 4 ? failures - 1 : 4];
         emit_state(NET_WAITING, wait_s, conn_err_text(rc));
@@ -699,17 +714,20 @@ bool net_init(const NetIdentity *id)
 void net_exit(void)
 {
     if (!thread) return;
+    conn_abort = 1;  // ends any connect, TLS or handshake wait the worker is in
     push_cmd(new_cmd(CMD_QUIT));
-    // No timeout: threadFree on a running thread is a no-op, and the worker must be gone before socExit.
-    // A blocked connect plus handshake bounds this at about 15 s.
-    threadJoin(thread, U64_MAX);
+    // No overall timeout: threadFree on a running thread is a no-op, and the worker must be gone before socExit.
+    // Only a DNS lookup can still hold it for a while. Free the events it queues meanwhile so it never waits on
+    // a full queue the UI no longer reads.
+    NetEvent *ev;
+    while (R_FAILED(threadJoin(thread, 100 * 1000000ULL)))
+        while ((ev = queue_pop(&events))) net_event_free(ev);
     threadFree(thread);
     thread = NULL;
     void *p;
     while ((p = queue_pop(&sends))) out_free(p);
     out_free(unsent);
     unsent = NULL;
-    NetEvent *ev;
     while ((ev = queue_pop(&events))) net_event_free(ev);
     noise_wipe(&ident, sizeof ident);
 }

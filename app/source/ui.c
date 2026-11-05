@@ -239,28 +239,28 @@ float text_block(const char *s, float x, float y, float w, float scale, const Te
     return y - y0;
 }
 
-// The Hermes wing (design/mockups/lib.mjs wing()) at 9 px, as coverage per pixel
-// (`python tools/build_meta.py --wing-c 9`). Drawn pixel by pixel on whole pixels so it stays crisp.
-static const uint8_t WING9[9 * 9] = {
-      0,   0,   0,   0,   0,   0,   0,   0,   0,
-      0,   0,   0,   0,   0,   1,  67, 142,  24,
-      0,   0,   0,   0,  62, 206, 224,  58,   0,
-      0,   0,   0, 120, 252, 255, 231, 180,  11,
-      0,   0, 124, 255, 255, 221, 131,  17,   0,
-      0,  66, 254, 255, 255, 213,  77,   0,   0,
-      2, 214, 255, 254, 196,  93,   3,   0,   0,
-     15,  78,  62,  17,   0,   0,   0,   0,   0,
-      0,   0,   0,   0,   0,   0,   0,   0,   0,
+// The Hermes caduceus at 9 px, as coverage per pixel (`python tools/build_meta.py --mark-c`, the same mark as
+// on the HOME banner). Drawn pixel by pixel on whole pixels so it stays crisp.
+static const uint8_t MARK9[9 * 9] = {
+      0,   0,   0,   0, 255,   0,   0,   0,   0,
+    255, 255, 150, 255, 255, 255, 150, 255, 255,
+    150, 255, 255, 255, 255, 255, 255, 255, 150,
+      0,   0,   0, 255, 255, 255,   0,   0,   0,
+      0,   0, 255,   0, 255,   0, 255,   0,   0,
+      0,   0,   0, 255, 255, 255,   0,   0,   0,
+      0,   0, 255,   0, 255,   0, 255,   0,   0,
+      0,   0,   0, 255, 255, 255,   0,   0,   0,
+      0,   0,   0,   0, 255,   0,   0,   0,   0,
 };
 
-void wing_mark(float x, float y, u32 color)
+void hermes_mark(float x, float y, u32 color)
 {
     x = floorf(x + 0.5f);
     y = floorf(y + 0.5f);
     u32 rgb = color & 0x00ffffff, a = color >> 24;
     for (int j = 0; j < 9; j++)
         for (int i = 0; i < 9; i++) {
-            u32 c = WING9[j * 9 + i];
+            u32 c = MARK9[j * 9 + i];
             if (c) rect(x + i, y + j, 1, 1, rgb | ((a * c / 255) << 24));
         }
 }
@@ -274,10 +274,22 @@ static void draw_signal(float x, float y, u32 color)
     rect(x + 7, y, 2, 7, color);
 }
 
+// A loudspeaker with two sound waves, 9 x 7 px: Spoken replies are on.
+static void draw_speaker(float x, float y, u32 color)
+{
+    rect(x, y + 2, 2, 3, color);
+    rect(x + 2, y + 1, 1, 5, color);
+    rect(x + 3, y, 1, 7, color);
+    rect(x + 5, y + 2, 1, 3, color);
+    rect(x + 7, y + 1, 1, 1, color);
+    rect(x + 8, y + 2, 1, 3, color);
+    rect(x + 7, y + 5, 1, 1, color);
+}
+
 void draw_header(const char *title)
 {
     rect(0, 0, TOP_W, TOP_HEADER_H, COL_BLUE);
-    wing_mark(7, 3.5f, COL_ON);
+    hermes_mark(7, 3.5f, COL_ON);
     float x = 19;
     x += spaced("HERMES", x, 4.5f, S_EYE, COL_ON, 1.6f) + 5;
     rect(x, 4.5f, 1, 7, COL_ON_3);
@@ -294,6 +306,12 @@ void draw_header(const char *title)
     if (app.net == NET_ONLINE) {
         draw_signal(right - 9, 4.5f, COL_ON);
         right -= 14;
+    }
+    if (app.screen == SCR_CHAT && app.settings.speak_replies) {  // Spoken replies on (More > Spoken replies)
+        float vw = spaced_width("VOICE", S_EYE, 1.0f);
+        spaced("VOICE", right - vw, 4.5f, S_EYE, COL_ON, 1.0f);
+        draw_speaker(right - vw - 12, 4.5f, COL_ON);
+        right -= vw + 18;
     }
     if (app.screen == SCR_CHAT && app.chat.model[0]) {
         float mw = text_width(app.chat.model, strlen(app.chat.model), S_TOOL);

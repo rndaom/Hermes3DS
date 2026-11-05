@@ -9,12 +9,19 @@ Drives the real ThreeDSAdapter + a protocol client through the paths a live chat
 from __future__ import annotations
 
 import asyncio
+import atexit
+import os
+import shutil
 import sys
 import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 HERMES = Path(sys.argv[1]) if len(sys.argv) > 1 else Path.home() / ".hermes" / "hermes-agent"
+# A throwaway Hermes home: the adapter records its state (gateway_state.json) there like a gateway would,
+# and must not touch the real one.
+os.environ["HERMES_HOME"] = tempfile.mkdtemp(prefix="h3ds-it-home-")
+atexit.register(shutil.rmtree, os.environ["HERMES_HOME"], True)
 sys.path.insert(0, str(HERMES))
 sys.path.insert(0, str(ROOT))
 
@@ -52,7 +59,9 @@ async def main() -> int:
     adapter_mod._data_dir = lambda: tmp
     h3ds.register(_Ctx())
 
-    cfg = PlatformConfig.from_dict({"enabled": True, "port": 0, "discovery_port": 0, "host": "127.0.0.1"})
+    # away off: the check must not touch this computer's Tailscale Funnel
+    cfg = PlatformConfig.from_dict({"enabled": True, "port": 0, "discovery_port": 0, "host": "127.0.0.1",
+                                    "away": "off"})
     ad = adapter_mod.ThreeDSAdapter(cfg)
     check("adapter connects", await ad.connect())
     srv = ad._server
@@ -139,7 +148,10 @@ async def main() -> int:
     await asyncio.sleep(0.1)
     await ad.edit_message(chat, r.message_id, "Done: **3** files changed.", finalize=True)
     c = await Client.connect("127.0.0.1", srv.port, static=device_key, server_key=srv.static.public)
+    # The reconnect also replays what was sent since the 3DS last spoke (the clarify notice); find the reply.
     ev = await c.next_event("msg", timeout=5)
+    while ev["mid"] != r.message_id:
+        ev = await c.next_event("msg", timeout=5)
     check("offline reply delivered on reconnect", ev["mid"] == r.message_id and ev["final"]
           and ev["text"] == "Done: 3 files changed." and ev.get("spans"), str(ev))
     await c.close()

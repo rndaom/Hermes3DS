@@ -33,7 +33,7 @@ void ui_init(void);
 void rect(float x, float y, float w, float h, u32 c);
 void disc(float cx, float cy, float r, u32 c);  // filled circle
 void frame_rect(float x, float y, float w, float h, u32 c);
-void wing_mark(float x, float y, u32 color);  // the Hermes wing, 9x9 px
+void hermes_mark(float x, float y, u32 color);  // the Hermes caduceus, 9x9 px
 void braille(float x, float y, float cell, u32 color);  // spinner cell, `cell` px tall
 void check_mark(float x, float y, float s, u32 color);
 float spaced(const char *s, float x, float y, float scale, u32 color, float spacing);  // letter-spaced caps

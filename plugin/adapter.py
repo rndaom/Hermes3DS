@@ -10,6 +10,7 @@ import json
 import logging
 import re
 import os
+import secrets
 import socket
 import subprocess
 import sys
@@ -21,12 +22,13 @@ from gateway.config import Platform
 from gateway.platforms.base import BasePlatformAdapter, SendResult
 from gateway.platforms.event import MessageEvent, MessageType
 
-from . import compat
-from .h3proto.away import AwayManager, parse_address, parse_mode
-from .h3proto.audio import voice_to_wav
+from . import compat, speech
+from .h3proto.away import AwayManager, effective_mode, parse_address, parse_mode
+from .h3proto.audio import MAX_SECONDS as MAX_SPEECH_SECONDS, ffmpeg_path, voice_to_wav
 from .h3proto.blobs import BlobStore
 from .h3proto import fetch
-from .h3proto.media import build_attachment, build_attachment_bytes, clean_name, is_image_name
+from .h3proto.media import (build_attachment, build_attachment_bytes, build_speech_attachment, clean_name,
+                            is_image_name)
 from .h3proto.pairing import Device, DeviceStore, TokenStore, load_or_create_key
 from .h3proto.emoji import emoji_for_3ds
 from .h3proto.richtext import markdown_to_rich, stream_to_rich
@@ -44,16 +46,23 @@ _MAX_CHARS = 8000  # keeps any UTF-8 message comfortably under the 64 KiB frame 
 DOWNLOAD_TIMEOUT = fetch.TIMEOUT  # seconds, per network operation of an image download
 DOWNLOAD_TOTAL = fetch.TOTAL      # seconds, whole download
 DOWNLOAD_MAX = fetch.MAX_BYTES
+# Message ids must not repeat after a gateway restart: Hermes keeps every inbound id (its session store
+# refuses a reused id with other content, `admission_conflict`, and treats one with the same content as a
+# replay it doesn't run again), and the 3DS keeps outbound ids in its chat cache. Each adapter gets its own
+# tag (Hermes can make a new one in the same process: reconnects, profiles); this one is for tests that skip
+# __init__. 40 bits; with the counter it stays inside the 3DS's 23-character speech ids.
+_RUN_TAG = secrets.token_hex(5)
 ATTACH_PER_MESSAGE = 8    # keeps the msg JSON far below the 64 KiB frame limit
 PHOTOS_PER_SEND = 4       # pictures one 3DS `send` may carry (protocol.md §4.4)
 HEARD_WAIT = 600.0        # seconds a voice message waits for Hermes' transcript echo
-# "Open on PC" hands the file to its default app; never do that for things that run code.
-_NO_OPEN_EXTS = {".exe", ".com", ".scr", ".bat", ".cmd", ".ps1", ".psm1", ".vbs", ".vbe", ".js", ".jse", ".wsf",
-                 ".wsh", ".hta", ".msi", ".msp", ".lnk", ".url", ".reg", ".jar", ".dll", ".cpl", ".sh", ".command",
-                 ".app", ".appimage", ".desktop", ".py", ".pyw", ".pyz", ".pl", ".rb", ".scpt", ".workflow",
-                 ".bash", ".zsh", ".fish", ".csh", ".ksh", ".run", ".bin", ".out", ".elf", ".so", ".deb", ".rpm",
-                 ".flatpak", ".flatpakref", ".snap", ".plasmoid", ".kwinscript", ".service", ".php", ".lua",
-                 ".tcl", ".ps", ".msix", ".appx", ".ahk", ".jnlp", ".pkg", ".dmg", ".mpkg"}
+# "Open on PC" hands the file to its default app, so only types that open in a viewer: pictures, sound, video
+# and documents without macros. A blocklist can't keep up with everything a desktop will run (.pif, .msc, .chm,
+# .iso, xdg-open guessing from content, ...), and legacy Office files, HTML and SVG can carry scripts.
+_OPEN_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tif", ".tiff", ".heic", ".avif",
+              ".mp3", ".wav", ".ogg", ".oga", ".opus", ".flac", ".m4a", ".aac",
+              ".mp4", ".m4v", ".webm", ".mkv", ".mov", ".avi",
+              ".pdf", ".txt", ".md", ".markdown", ".csv", ".tsv", ".json", ".log", ".yaml", ".yml", ".toml",
+              ".rtf", ".docx", ".xlsx", ".pptx", ".odt", ".ods", ".odp", ".epub"}
 
 
 def _data_dir():
@@ -92,7 +101,7 @@ def _echo_template() -> tuple[str, str]:
     """Hermes' transcript echo (`gateway.voice.transcript_echo_short`, e.g. '🎙️ "{text}"') split around
     the text, in the gateway's language."""
     with contextlib.suppress(Exception):
-        from agent.i18n import t
+        from gateway.platforms.base import t
         marker = "\x00"
         head, sep, tail = t("gateway.voice.transcript_echo_short", text=marker).partition(marker)
         if sep and head:
@@ -124,11 +133,38 @@ def _cut(text, limit: int):
     return text[:limit] + f"… ({len(text) - limit} more characters)"
 
 
+class _Speech:
+    """One streamed spoken reply (Hermes' streaming-TTS handle). The PCM is posted as one message when the model
+    is done. For an app that plays `speak` events (`speech_id` set), it goes out in groups as it comes (`pacer`)
+    as those events instead, and the chat gets no voice message. For an app that only plays voice messages one
+    after another (`grouped`), the groups are the messages."""
+
+    def __init__(self, chat_id: str, audio_format: Any, grouped: bool = False, speech_id: Optional[str] = None):
+        self.chat_id = chat_id
+        self.audio_format = audio_format
+        self.audible = False
+        self.aborted = False
+        self.grouped = grouped
+        self.speech_id = speech_id     # the `speak` events' id: played by the app, nothing posted in the chat
+        self.pcm = bytearray()         # not posted yet
+        self.accepted = 0              # bytes taken so far, posted or not
+        self.posts = 0                 # messages posted
+        self.pacer = speech.Pacer()
+        self.lock = asyncio.Lock()     # one post at a time, in order
+        self.timer: Optional[asyncio.TimerHandle] = None  # posts what is pending before the app runs dry
+        self.tasks: set[asyncio.Task] = set()
+
+    @property
+    def seconds(self) -> float:
+        return len(self.pcm) / (2.0 * self.audio_format.sample_rate)
+
+
 class ThreeDSAdapter(BasePlatformAdapter):
     SUPPORTS_MESSAGE_EDITING = True
     supports_status_text = True
     REQUIRES_EDIT_FINALIZE = True
     MAX_MESSAGE_LENGTH = _MAX_CHARS
+    speech_groups = True  # config `speech_groups`: post a spoken reply in parts as it is written (see speech.py)
 
     def __init__(self, config, **kwargs):
         super().__init__(config=config, platform=Platform(PLATFORM))
@@ -138,15 +174,18 @@ class ThreeDSAdapter(BasePlatformAdapter):
         self.discovery_port = int(_cfg(extra, "discovery_port", DEFAULT_DISCOVERY_PORT))
         self.secure = str(_cfg(extra, "security", "secure")).lower() != "plaintext"
         self.server_name = str(_cfg(extra, "name", "") or socket.gethostname())
-        self.away_mode = parse_mode(_cfg(extra, "away", "auto"))
+        self.away_mode = parse_mode(_cfg(extra, "away", ""))  # resolved against the CLI flags in connect()
         self.away_port = int(_cfg(extra, "away_port", DEFAULT_AWAY_PORT))
         self.away_public_port = int(_cfg(extra, "away_public_port", 0) or 0)
         self.away_address = parse_address(_cfg(extra, "away_address", ""))
+        self.speech_groups = str(_cfg(extra, "speech_groups", "true")).strip().lower() not in ("0", "false", "no", "off")
         self._away_task: Optional[asyncio.Task] = None
         self._server: Optional[Hermes3DSServer] = None
         self._chat_keys: dict[str, bytes] = {}   # chat_id -> device key
         self._chat_names: dict[str, str] = {}
         self._ids = itertools.count(1)
+        self._run_tag = secrets.token_hex(5)
+        self._queued: dict[str, int] = {}  # chat_id -> messages sent while a turn was running, for `status`
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._trace_path = None
         self._approval_cards: dict[str, tuple[str, str]] = {}  # card mid -> (chat_id, session_key)
@@ -174,10 +213,11 @@ class ThreeDSAdapter(BasePlatformAdapter):
             self._blobs = BlobStore(data / "blobs")
         except OSError as exc:
             logger.warning("3DS: blob store unavailable, media attachments disabled: %s", exc)
+        away_mode = effective_mode(self.away_mode, data, self.away_address)
         server = Hermes3DSServer(
             ServerConfig(host=self.host, port=self.port, discovery_port=self.discovery_port,
                          secure=self.secure, name=self.server_name,
-                         away_port=0 if self.away_mode == "off" or not self.secure else self.away_port),
+                         away_port=0 if away_mode == "off" or not self.secure else self.away_port),
             _Backend(self), static, DeviceStore(data / "devices.json"), TokenStore(data / "pair_tokens.json"),
             server_info={"hermes": _hermes_version()}, blobs=self._blobs)
         try:
@@ -195,13 +235,15 @@ class ThreeDSAdapter(BasePlatformAdapter):
             logger.warning("3DS: PLAINTEXT dev mode — traffic is unencrypted and unauthenticated")
         self._mark_connected()
         self._wire_plugin_handlers(None)
+        if speech.is_pinned():  # the first spoken reply shouldn't wait for the voice model to load
+            self._loop.run_in_executor(None, speech.warm_voice)
         logger.info("3DS: listening on %s:%s (%s)", self.host, server.port, "secure" if self.secure else "plaintext")
         if server.away_port:
-            away = AwayManager(server, data, mode=self.away_mode, address=self.away_address,
+            away = AwayManager(server, data, mode=away_mode, address=self.away_address,
                                public_port=self.away_public_port)
             self._away_task = asyncio.get_running_loop().create_task(away.run())
-        else:
-            await server.set_away(None)  # paired 3DSes forget their away address
+        else:  # paired 3DSes forget their away address; `hermes 3ds away` reports it off
+            await AwayManager(server, data, mode="off").once()
         return True
 
     async def disconnect(self) -> None:
@@ -224,7 +266,7 @@ class ThreeDSAdapter(BasePlatformAdapter):
         return self._chat_keys.get(chat_id)
 
     def _mid(self, prefix: str = "m") -> str:
-        return f"{prefix}{next(self._ids)}"
+        return f"{prefix}{getattr(self, '_run_tag', _RUN_TAG)}-{next(self._ids)}"
 
     def _trace(self, what: str, **fields: Any) -> None:
         """Opt-in debug log: create <plugin-data>/3ds/trace to record every outbound call."""
@@ -242,6 +284,16 @@ class ThreeDSAdapter(BasePlatformAdapter):
         # vouches for it; no Hermes allowlist entry is needed.
         return self.build_source(chat_id=cid, chat_name=device.name, chat_type="dm", user_id=device.fp,
                                  user_name=device.name, role_authorized=True)
+
+    async def reauthorize_native_roles(self, source) -> bool:
+        """Hermes' session authority re-checks a role_authorized source before it runs a turn (and when
+        it recovers one after a restart); the flag alone grants nothing. Vouch again only while the device
+        is still paired, so `hermes 3ds unpair` also revokes turns already queued for it."""
+        server = self._server
+        if server is None or source.chat_type != "dm":
+            return False
+        return any(dev.fp == source.user_id and chat_id_for(dev) == source.chat_id
+                   for dev in server.devices.all())
 
     def register_device(self, device: Device) -> str:
         cid = chat_id_for(device)
@@ -318,6 +370,12 @@ class ThreeDSAdapter(BasePlatformAdapter):
         self._awaiting_heard[chat_id] = waiting
         await self._server.event(key, {"t": "heard", "req": req, "text": emoji_for_3ds(text)[:4000]})
         return True
+
+    async def on_processing_start(self, event: MessageEvent) -> None:
+        cid = event.source.chat_id
+        if self._queued.get(cid, 0) > 0:
+            self._queued[cid] -= 1
+        await super().on_processing_start(event)
 
     # --- outbound: messages -----------------------------------------------------------
 
@@ -477,6 +535,115 @@ class ThreeDSAdapter(BasePlatformAdapter):
                          **kwargs) -> SendResult:
         return await self._send_local(chat_id, audio_path, caption, try_image=False, try_audio=True, voice=True)
 
+    async def play_tts(self, chat_id: str, audio_path: str, **kwargs) -> SendResult:
+        """A spoken reply made in one piece (Hermes' auto-TTS without streaming): an app that plays `speak` events
+        gets it as one, so it is heard without a voice message under the reply; any other gets the voice message."""
+        key = self._key(chat_id)
+        if key is None or self._server is None or not self._server.has_cap(key, speech.SPEAK_CAP, offline=True):
+            return await self.send_voice(chat_id, audio_path, **kwargs)
+        if self._blobs is None:
+            return SendResult(success=False, error="media store unavailable")
+        p = Path(os.path.expanduser(str(audio_path or "")))
+        if not p.is_file():
+            return SendResult(success=False, error="file not found", error_kind="not_found")
+        try:
+            att = await asyncio.to_thread(build_attachment, self._blobs, p, None, None, False, True)
+        except OSError as exc:
+            return SendResult(success=False, error=f"cannot read file: {exc}")
+        if att.get("kind") != "audio":
+            return SendResult(success=False, error="the spoken reply could not be converted for the 3DS")
+        att["voice"] = True
+        self._trace("speech", chat_id=chat_id, ms=att.get("ms"), file=p.name)
+        await self._server.event(key, {"t": "speak", "speech": self._mid("s"), "attach": att})
+        return SendResult(success=True)
+
+    # --- spoken replies as they are written (Hermes' streaming TTS; see speech.py) ------------------
+
+    def supports_streaming_tts(self, chat_id: str, audio_format: Any) -> bool:
+        return (self._blobs is not None and self._server is not None and chat_id in self._chat_keys
+                and ffmpeg_path() is not None and audio_format.channels == 1 and audio_format.sample_width == 2
+                and 4000 <= audio_format.sample_rate <= 48000)
+
+    async def begin_streaming_tts(self, chat_id: str, audio_format: Any,
+                                  metadata: Optional[Dict[str, Any]] = None) -> Optional[_Speech]:
+        key = self._key(chat_id)
+        live = bool(self.speech_groups and key is not None and self._server is not None)
+        if live and self._server.has_cap(key, speech.SPEAK_CAP, offline=True):  # an app away now hears none of it
+            return _Speech(chat_id, audio_format, speech_id=self._mid("s"))
+        return _Speech(chat_id, audio_format, live and self._server.has_cap(key, speech.VOICE_QUEUE_CAP))
+
+    async def write_streaming_tts(self, handle: _Speech, chunk: bytes) -> None:
+        room = (MAX_SPEECH_SECONDS * handle.audio_format.sample_rate * 2 - handle.accepted) & ~1
+        if handle.aborted or room <= 0:
+            return
+        chunk = chunk[:room]
+        handle.pcm += chunk
+        handle.accepted += len(chunk)
+        if handle.grouped or handle.speech_id:
+            await self._pace_speech(handle)
+
+    async def _pace_speech(self, handle: _Speech) -> None:
+        """Post the pending speech when the pacer says so, else make sure it goes out before the app runs dry."""
+        if handle.timer is not None:
+            handle.timer.cancel()
+            handle.timer = None
+        if handle.pcm and handle.pacer.due(handle.seconds):
+            await self._post_speech(handle)
+        elif handle.pcm:
+            handle.timer = asyncio.get_running_loop().call_later(handle.pacer.wait(), self._speech_timer, handle)
+
+    def _speech_timer(self, handle: _Speech) -> None:
+        handle.timer = None
+        task = asyncio.ensure_future(self._post_speech(handle, quiet=True))
+        handle.tasks.add(task)
+        task.add_done_callback(handle.tasks.discard)
+
+    async def _post_speech(self, handle: _Speech, quiet: bool = False) -> None:
+        """Encode what is pending and post it as one voice message, or as a `speak` event when the app plays
+        those. `quiet`: a background post, so a failure is logged (nobody awaits it) instead of raised."""
+        async with handle.lock:
+            pcm, handle.pcm = bytes(handle.pcm), bytearray()
+            if handle.aborted or not pcm:
+                return
+            try:
+                att = await asyncio.to_thread(build_speech_attachment, self._blobs, pcm, handle.audio_format.sample_rate)
+                if att is None:
+                    raise RuntimeError("spoken reply could not be encoded")
+                if handle.aborted:  # the reply was cut while this was being encoded
+                    return
+                self._trace("speech", chat_id=handle.chat_id, ms=att["ms"], pcm=len(pcm), part=handle.posts + 1)
+                key = self._key(handle.chat_id)
+                if handle.speech_id and key is not None and self._server is not None:
+                    await self._server.event(key, {"t": "speak", "speech": handle.speech_id, "attach": att})
+                elif not handle.speech_id:
+                    await self._post_attachments(handle.chat_id, [att], None)
+            except Exception as exc:
+                if not quiet:
+                    raise
+                logger.warning("3DS: a part of the spoken reply was not sent: %s", exc)
+                return
+            handle.posts += 1
+            handle.pacer.posted(att["ms"] / 1000.0)
+
+    async def finish_streaming_tts(self, handle: _Speech, *, interrupted: bool = False) -> None:
+        if handle.timer is not None:
+            handle.timer.cancel()
+            handle.timer = None
+        if interrupted:
+            handle.aborted = True
+        if handle.aborted:
+            handle.pcm = bytearray()
+        await self._post_speech(handle)
+        if handle.tasks:  # a timed post still running was queued before this one, so it has gone out
+            await asyncio.gather(*handle.tasks, return_exceptions=True)
+
+    async def abort_streaming_tts(self, handle: _Speech, error: Optional[str] = None) -> None:
+        handle.aborted = True
+        handle.pcm = bytearray()
+        if handle.timer is not None:
+            handle.timer.cancel()
+            handle.timer = None
+
     async def send_video(self, chat_id: str, video_path: str, caption: Optional[str] = None,
                          reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None,
                          **kwargs) -> SendResult:
@@ -525,7 +692,7 @@ class ThreeDSAdapter(BasePlatformAdapter):
         path = self._blobs.original_path(blob)
         if path is None:
             raise RequestError("not_found", "file is gone")
-        if not path.suffix or path.suffix.lower() in _NO_OPEN_EXTS:  # no extension: could be a program
+        if path.suffix.lower() not in _OPEN_EXTS:
             raise RequestError("denied", "this file type is not opened remotely")
         if sys.platform not in ("win32", "darwin") and not (os.environ.get("DISPLAY")
                                                             or os.environ.get("WAYLAND_DISPLAY")):
@@ -594,9 +761,8 @@ class ThreeDSAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="unknown chat", error_kind="not_found")
         multi = False
         with contextlib.suppress(Exception):
-            from tools import clarify_gateway as cg
-            with cg._lock:
-                multi = bool(getattr(cg._entries.get(clarify_id), "multi_select", False))
+            from tools.clarify_gateway import get_pending
+            multi = bool(getattr(get_pending(clarify_id), "multi_select", False))
         if not choices:
             with contextlib.suppress(Exception):
                 from tools.clarify_gateway import mark_awaiting_text
@@ -633,13 +799,12 @@ class ThreeDSAdapter(BasePlatformAdapter):
             response = str(text)
             if choices:  # "2" or "1,3" means those choices, as on the other platforms
                 with contextlib.suppress(Exception):
-                    from tools import clarify_gateway as cg
-                    with cg._lock:
-                        entry = cg._entries.get(cid)
-                    if entry is not None:
-                        coerced, _ = cg._coerce_text_response_detailed(entry, response)
-                        if coerced is not None:
-                            response = coerced
+                    from tools.clarify_gateway import SKIPPED, get_pending
+                    from .h3proto.clarify_text import coerce
+                    entry = get_pending(cid)
+                    coerced = coerce(entry, response, SKIPPED) if entry is not None else None
+                    if coerced is not None:
+                        response = coerced
         else:
             raise RequestError("bad_request", "answer needs choice, choices or text")
         ok = resolve_gateway_clarify(cid, response)
@@ -694,6 +859,10 @@ class _Backend:
             return max(0, int(msg.get("offset") or 0)), max(1, min(50, int(msg.get("limit") or 20)))
 
         if t == "send":
+            # Count what waits behind a running turn; Hermes may merge queued messages into one turn, so the
+            # count is only trusted while the chat is busy and starts over when it isn't.
+            cid = chat_id_for(device)
+            a._queued[cid] = a._queued.get(cid, 0) + 1 if self._busy(device) else 0
             text = str(msg.get("text") or "").strip()
             voice, attach = msg.get("voice"), msg.get("attach")
             if len(text) > 16000:
@@ -729,7 +898,9 @@ class _Backend:
         runner = self._runner()
         source = a.source_for(device)
         if t == "status":
-            return {"t": "status_r", "now": time.time(), **await compat.status(runner, source, self._busy(device))}
+            busy = self._busy(device)
+            queued = getattr(a, "_queued", {}).get(chat_id_for(device), 0) if busy else 0
+            return {"t": "status_r", "now": time.time(), **await compat.status(runner, source, busy, queued)}
         if t == "sessions.list":
             off, lim = page()
             return {"t": "sessions.list_r", "items": await compat.sessions_list(runner, source, off, lim, msg.get("q"))}
@@ -752,7 +923,8 @@ class _Backend:
         if t == "commands.list":
             return {"t": "commands.list_r", "items": await compat.commands_list()}
         if t == "models.list":
-            return {"t": "models.list_r", **await compat.models_list()}
+            key = (await compat.current_session(runner, source))["key"]
+            return {"t": "models.list_r", **await compat.models_list(runner, key)}
         if t == "skills.list":
             return {"t": "skills.list_r", "items": await compat.skills_list()}
         if t == "tools.list":

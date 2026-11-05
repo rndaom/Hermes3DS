@@ -14,13 +14,16 @@
 #include "image.h"
 #include "net.h"
 #include "perf.h"
+#include "speak.h"
 #include "store.h"
 #include "text.h"
 #include "upload.h"
 #include "viewer.h"
 #include "voice.h"
 
-#define APP_VERSION "3ds-0.5.0"
+#ifndef APP_VERSION  // set by the Makefile (VERSION_MAJOR/MINOR/MICRO)
+#define APP_VERSION "3ds-dev"
+#endif
 #define SOC_BUFFER_SIZE 0x100000
 #define ANIM_FRAME_MS 80  // spinner frame time; redraws are throttled to this when only animating
 
@@ -136,6 +139,7 @@ int main(void)
         led_waiting(app.chat.approval || app.chat.clarify);
         blob_tick();
         audio_tick();
+        speak_tick();
         voice_tick();
         camera_tick();
         upload_tick();

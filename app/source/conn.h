@@ -41,6 +41,8 @@ typedef struct {
 } Conn;
 
 void conn_init(Conn *c);
+// Set from another thread to end every connect, discovery, TLS and handshake wait at once (app exit).
+extern volatile int conn_abort;
 // Resolve and connect within timeout_ms. `host` is an IPv4 literal or a name.
 int conn_open(Conn *c, const char *host, uint16_t port, int timeout_ms);
 // The address the last conn_open dialed and, when it failed, the OS error (0 = none), for logs.

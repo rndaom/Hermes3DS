@@ -17,6 +17,8 @@ typedef struct {
 
 bool audio_playable(const json_t *a);  // an attachment with a usable `audio` blob
 void audio_toggle(const json_t *a);    // play/pause `a`, switching to it from another track
+void audio_prefetch(const json_t *a);  // start downloading `a`, which is queued to play next
+void audio_forget(const json_t *a);    // stop a prefetch that won't be played (not the current track)
 void audio_seek(float seconds);        // relative, on the current track
 void audio_pause(void);                // pause the current track (the mic is about to listen)
 bool audio_status(const json_t *a, AudioStatus *s);  // true when `a` is the current track

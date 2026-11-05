@@ -167,10 +167,11 @@ class Client:
             self._blob_rx.pop(blob, None)
 
     async def put_blob(self, blob: str, data: bytes, mime: str, name: str = "", *, stop_at: int | None = None,
-                       chunk: int = 32768, timeout: float = 60.0) -> int:
+                       chunk: int = 32768, timeout: float = 60.0, wait: bool = True) -> int:
         """Upload `data` as `blob` (protocol.md §5.1), resuming from what the PC already has. With `stop_at`,
         stop sending there (an interrupted upload, for tests) and return the offset reached; else wait for
-        `blob.put_done` and return the size."""
+        `blob.put_done` and return the size. `wait=False` returns right after the last chunk instead (for a
+        caller that reads the events itself, where this would race it for `blob.put_done`)."""
         reply = await self.request("blob.put", timeout=timeout, blob=blob, size=len(data), mime=mime, name=name)
         off = reply["offset"]
         end = len(data) if stop_at is None else min(stop_at, len(data))
@@ -179,6 +180,8 @@ class Client:
             await self.channel.send_body(encode_blob_chunk(blob, off, piece))
             off += len(piece)
         if stop_at is not None and end < len(data):
+            return off
+        if not wait:
             return off
         while True:
             ev = await self.next_event("blob.put_done", "error", timeout=timeout)

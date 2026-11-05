@@ -86,9 +86,9 @@ _TABLE: dict[str, str] = {
     "💚": ":green_heart:", "💙": ":blue_heart:", "💜": ":purple_heart:", "🖤": ":black_heart:",
     "🤍": ":white_heart:", "💖": ":sparkling_heart:", "💕": ":hearts:",
     # common sequences (matched before ZWJ/selectors are dropped)
-    "❤️‍🔥": ":heart_on_fire:", "🏳️‍🌈": ":rainbow_flag:", "🏳️‍⚧️": ":transgender_flag:",
-    "🏴‍☠️": ":pirate_flag:", "👨‍💻": ":technologist:", "👩‍💻": ":technologist:", "🧑‍💻": ":technologist:",
-    "😶‍🌫️": ":face_in_clouds:", "😮‍💨": ":exhale:", "🐕‍🦺": ":service_dog:",
+    "❤\ufe0f\u200d🔥": ":heart_on_fire:", "🏳\ufe0f\u200d🌈": ":rainbow_flag:", "🏳\ufe0f\u200d⚧\ufe0f": ":transgender_flag:",
+    "🏴\u200d☠\ufe0f": ":pirate_flag:", "👨\u200d💻": ":technologist:", "👩\u200d💻": ":technologist:", "🧑\u200d💻": ":technologist:",
+    "😶\u200d🌫\ufe0f": ":face_in_clouds:", "😮\u200d💨": ":exhale:", "🐕\u200d🦺": ":service_dog:",
 }
 
 _KEYCAP = "⃣"
@@ -216,7 +216,7 @@ def emoji_to_text(s: str) -> str:
 # --- sprites ---------------------------------------------------------------------------------------------
 
 _SET_FILE = Path(__file__).with_name("emoji_set.json")
-_VS = {"️": 1, "︎": -1}  # emoji / text presentation of the previous character
+_VS = {"\ufe0f": 1, "\ufe0e": -1}  # emoji / text presentation of the previous character
 
 
 def _load_set() -> tuple[str | None, int, list[str]]:
@@ -230,7 +230,7 @@ def _load_set() -> tuple[str | None, int, list[str]]:
 
 SET_ID, BASE, _SET_SEQS = _load_set()
 CAP = f"emoji:{SET_ID}" if SET_ID else None  # hello cap of an app that draws this set
-_SPRITES: dict[str, int] = {s.replace("️", ""): i for i, s in enumerate(_SET_SEQS)}
+_SPRITES: dict[str, int] = {s.replace("\ufe0f", ""): i for i, s in enumerate(_SET_SEQS)}
 _SPRITE_SEQS: dict[str, list[str]] = {}
 for _k in sorted((k for k in _SPRITES if len(k) > 1), key=len, reverse=True):
     _SPRITE_SEQS.setdefault(_k[0], []).append(_k)

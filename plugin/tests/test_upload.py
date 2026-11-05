@@ -230,6 +230,10 @@ class _Event:
 class _UploadServer:
     def __init__(self, blobs):
         self.blobs, self.events, self.posted = blobs, [], []
+        self.caps = set()  # what the connected app's hello advertised
+
+    def has_cap(self, key, cap, *, offline=False):
+        return cap in self.caps
 
     def upload_path(self, device, bid):
         return self.blobs.upload_path(bid, device.fp)
@@ -266,6 +270,7 @@ def ad(adapter_mod, tmp_path, monkeypatch):  # noqa: F811
     a._server = _UploadServer(a._blobs)
     a._chat_keys = {"dev:fp1": b"k" * 32}
     a._ids = iter(range(1, 100))
+    a._queued = {}
     a._trace_path = None
     a._awaiting_heard = {}
     a.handled = []
@@ -352,3 +357,25 @@ def test_welcome_says_whether_hermes_speaks_in_this_chat(ad):
     assert asyncio.run(backend.welcome_state(_device()))["voice"] is False
     ad._auto_tts_enabled_chats.add("dev:fp1")
     assert asyncio.run(backend.welcome_state(_device()))["voice"] is True
+
+
+def test_queued_counts_messages_sent_during_a_turn(ad, adapter_mod):
+    backend = adapter_mod._Backend(ad)
+    busy = [False]
+    backend._busy = lambda device: busy[0]
+    send = {"t": "send", "id": 1, "text": "hi"}
+    asyncio.run(backend.handle(_device(), send))
+    assert ad._queued == {"dev:fp1": 0}
+    busy[0] = True
+    asyncio.run(backend.handle(_device(), send))
+    asyncio.run(backend.handle(_device(), send))
+    assert ad._queued["dev:fp1"] == 2
+    started = types.SimpleNamespace(source=types.SimpleNamespace(chat_id="dev:fp1"))
+    asyncio.run(ad.on_processing_start(started))
+    assert ad._queued["dev:fp1"] == 1
+    # Hermes merged the rest into that turn: the next message after it finishes starts the count over.
+    busy[0] = False
+    asyncio.run(backend.handle(_device(), send))
+    assert ad._queued["dev:fp1"] == 0
+    asyncio.run(ad.on_processing_start(started))
+    assert ad._queued["dev:fp1"] == 0

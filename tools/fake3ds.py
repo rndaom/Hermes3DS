@@ -9,9 +9,13 @@
 
 In chat, plain text is sent as a message ("/model x" etc. work too). Protocol requests start with ':' —
 :status :sessions :history [sid] :resume <sid> :new [title] :models :skills :tools :jobs :commands
-:stop :approve <once|session|always|deny> :answer <n|text> :get <blob> [file] :open <blob> :wait :quit
+:stop :approve <once|session|always|deny> :answer <n|text> :get <blob> [file] :open <blob> :voice <audio file>
+:wait :quit
 Attachments print as `[image name 800x600 view=b1 thumb=b2 file=b3]`; `:get b1 out.jpg` downloads a blob (or
 start with --save-blobs DIR to download every attachment blob as it arrives), `:open b3` asks the PC to open it.
+`:voice speech.wav` sends the file as a voice message, encoded like the 3DS microphone (16360 Hz IMA-ADPCM; needs
+ffmpeg); Hermes' transcript prints as `heard`. Spoken replies play as `speak` parts, then land whole as
+`[audio ... voice ...]`.
 """
 
 from __future__ import annotations
@@ -20,17 +24,21 @@ import argparse
 import asyncio
 import json
 import os
+import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "plugin"))
 
+from h3proto import audio  # noqa: E402
 from h3proto.client import Client, ServerError, discover, load_device_key  # noqa: E402
 from h3proto.pairing import fingerprint, parse_pairing_uri, token_from_code, unb64u  # noqa: E402
 
 STATE = Path(__file__).resolve().parents[1] / ".fake3ds"
 DEVICE_NAME = "Fake 3DS"
+CAPS = ["jpeg", "png", "pcm16"]  # as the library client says by default
 
 C_BLUE, C_DIM, C_YEL, C_RED, C_GRN, C_OFF = "\033[94m", "\033[2m", "\033[93m", "\033[91m", "\033[92m", "\033[0m"
 
@@ -90,8 +98,10 @@ class Printer:
 
     def _attachments(self, ev: dict) -> None:
         for att in ev.get("attach") or []:
-            refs = {k: att[k]["id"] for k in ("view", "thumb", "file", "text") if isinstance(att.get(k), dict)}
+            refs = {k: att[k]["id"] for k in ("view", "thumb", "file", "text", "audio") if isinstance(att.get(k), dict)}
             dims = f" {att['w']}x{att['h']}" if "w" in att else ""
+            if att.get("voice"):
+                dims += f" voice {att.get('ms', 0) / 1000:.1f}s"  # a spoken reply (or a part of one)
             print(f"{C_GRN}  [{att.get('kind')} {att.get('name')}{dims} {att.get('size')}B "
                   + " ".join(f"{k}={v}" for k, v in refs.items()) + f"]{C_OFF}")
             if self.save_dir and self.client:
@@ -136,6 +146,13 @@ class Printer:
                 print(f"◆ {ev['text']}{spans}")
             else:
                 print(f"\r◆ {ev['text']}", end="", flush=True)
+        elif t == "heard":
+            self._end_stream()
+            print(f"{C_DIM}  heard: {ev.get('text')}{C_OFF}")
+        elif t == "speak":  # a part of a spoken reply, played and not shown; the chat gets the whole at the end
+            self._end_stream()
+            print(f"{C_DIM}  speak {ev.get('speech')}:{C_OFF}", end="")
+            self._attachments({"attach": [ev.get("attach") or {}]})
         elif t == "typing":
             self.busy = ev["on"]
             if ev["on"]:
@@ -178,6 +195,33 @@ class Printer:
 def show_items(items: list, fields: list[str]) -> None:
     for i, it in enumerate(items):
         print(f"  {i:>2}. " + "  ".join(str(it.get(f, ""))[:60] for f in fields if it.get(f) not in (None, "")))
+
+
+MIC_RATE = 16360  # the 3DS microphone
+
+
+def _mic_adpcm(path: str) -> dict:
+    """Any audio file → mono IMA-ADPCM at the microphone's rate, the way the app encodes a recording."""
+    exe = audio.ffmpeg_path()
+    if not exe:
+        raise SystemExit("ffmpeg is needed to encode a voice message")
+    with tempfile.TemporaryDirectory(prefix="fake3ds-") as tmp:
+        out = os.path.join(tmp, "voice.wav")
+        subprocess.run([exe, "-nostdin", "-loglevel", "error", "-y", "-i", path, "-vn", "-ac", "1", "-ar", str(MIC_RATE),
+                        "-c:a", "adpcm_ima_wav", "-block_size", str(audio.BLOCK), "-f", "wav", out], check=True)
+        wav = audio.parse_wav(Path(out).read_bytes())
+    if wav is None:
+        raise SystemExit("ffmpeg produced no ADPCM")
+    return wav
+
+
+async def send_voice(c: Client, path: str) -> None:
+    wav = await asyncio.to_thread(_mic_adpcm, path)
+    blob = "u" + os.urandom(10).hex()  # a client-chosen id, new for every recording
+    await c.put_blob(blob, wav["data"], audio.MIME, "voice", wait=False)  # chat's event printer reads put_done
+    ms = wav["samples"] * 1000 // wav["rate"]
+    await c.request("send", text="", voice={"blob": blob, "rate": wav["rate"], "block": wav["block"], "ms": ms})
+    print(f"{C_DIM}  voice message sent ({ms / 1000:.1f} s, {len(wav['data']) // 1024} KB){C_OFF}")
 
 
 async def run_command(c: Client, p: Printer, line: str) -> bool:
@@ -225,6 +269,8 @@ async def run_command(c: Client, p: Printer, line: str) -> bool:
         elif cmd == "open":
             await c.request("blob.open", blob=arg.strip())
             print("  opened on the PC")
+        elif cmd == "voice":
+            await send_voice(c, arg.strip())
         elif cmd == "approve":
             ap = p.prompts.get("approval")
             if not ap:
@@ -249,12 +295,15 @@ async def run_command(c: Client, p: Printer, line: str) -> bool:
 
 
 async def cmd_chat(args) -> None:
+    # Like the app: voiceq plays voice messages one after another, speak plays `speak` events.
+    caps = CAPS + ([] if args.no_voiceq else ["voiceq"]) + ([] if args.no_speak else ["speak"])
     if args.plaintext:
-        c = await Client.connect(args.host or "127.0.0.1", args.port or 7333, device=DEVICE_NAME)
+        c = await Client.connect(args.host or "127.0.0.1", args.port or 7333, device=DEVICE_NAME, caps=caps)
     else:
         srv = load_server()
         c = await Client.connect(args.host or srv["host"], args.port or srv["port"], device=DEVICE_NAME,
-                                 static=load_device_key(STATE / "device_key"), server_key=bytes.fromhex(srv["key"]))
+                                 static=load_device_key(STATE / "device_key"), server_key=bytes.fromhex(srv["key"]),
+                                 caps=caps)
     print(f"{C_GRN}connected to {c.welcome.get('server')} (hermes {c.welcome.get('hermes')}), "
           f"{'secure' if c.channel.secure else 'PLAINTEXT'}; chat {json.dumps(c.welcome.get('chat'))}{C_OFF}")
     p = Printer()
@@ -345,6 +394,10 @@ def main() -> None:
     cp.add_argument("--host")
     cp.add_argument("--port", type=int)
     cp.add_argument("--plaintext", action="store_true")
+    cp.add_argument("--no-voiceq", action="store_true",
+                    help="don't say the app plays voice messages one after another (spoken replies then arrive whole)")
+    cp.add_argument("--no-speak", action="store_true",
+                    help="don't say the app plays speak events (spoken replies then come as several voice messages)")
     cp.add_argument("--script")
     cp.add_argument("--save-blobs", metavar="DIR", help="download every attachment blob into DIR")
     cp.add_argument("--turn-timeout", type=float, default=600)

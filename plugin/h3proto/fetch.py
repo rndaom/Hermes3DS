@@ -40,9 +40,20 @@ async def download(url: str, *, max_bytes: int = MAX_BYTES, timeout: float = TIM
             raise DownloadError("blocked URL (private or unsafe address)")
 
     async def fetch() -> Tuple[bytes, str, str]:
-        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, max_redirects=MAX_REDIRECTS,
-                                     event_hooks={"request": [check]}, transport=transport,
-                                     headers={"User-Agent": USER_AGENT}) as client:
+        opts = dict(timeout=timeout, follow_redirects=True, max_redirects=MAX_REDIRECTS,
+                    event_hooks={"request": [check]}, headers={"User-Agent": USER_AGENT})
+        client = None
+        if transport is None:
+            # Inside Hermes: its client checks every address at connect time, so a name that passed `is_safe`
+            # can't be re-resolved to a private one (DNS rebinding), and it ignores no redirect.
+            try:
+                from gateway.platforms.helpers import platform_http_client
+                client = platform_http_client(**opts)
+            except ImportError:
+                pass
+        if client is None:
+            client = httpx.AsyncClient(transport=transport, **opts)
+        async with client:
             async with client.stream("GET", url) as resp:
                 if resp.status_code >= 400:
                     raise DownloadError(f"HTTP {resp.status_code}")

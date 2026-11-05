@@ -268,7 +268,7 @@ static void draw_message(int i, const Block *b, float y, float top, float bottom
         float ty = y;
         if (b->head) {
             frame_rect(PAD_X, y, 15, 15, COL_LINE_B);
-            wing_mark(PAD_X + 3, y + 3, COL_BLUE);
+            hermes_mark(PAD_X + 3, y + 3, COL_BLUE);
             float w = spaced("HERMES", TEXT_X, y + 4, S_EYE, COL_BLUE, 1.6f);
             if (tbuf[0]) text_draw(tbuf, TEXT_X + w + 5, y + 3.5f, S_EYE * 1.1f, COL_TX_3);
             ty += b->head_h;
