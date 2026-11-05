@@ -214,7 +214,9 @@ Report security problems privately: see [SECURITY.md](SECURITY.md).
 **App:** install [devkitPro](https://devkitpro.org/wiki/Getting_Started) with the `3ds-dev` group and the
 portlibs `3ds-mbedtls 3ds-libjpeg-turbo 3ds-libpng 3ds-zlib 3ds-jansson`, then run `app/build.sh` (or `make` in
 `app/`). `app/build.sh cia` makes the installable `hermes3ds.cia` (needs `makerom` and `bannertool` on PATH;
-the icon and HOME Menu banner are in `app/meta/`, made by `tools/build_meta.py`). Host tests:
+the icon and HOME Menu banner are in `app/meta/`, made by `tools/build_meta.py`; the Hermes boot logo, made by
+`tools/build_logo.py`, needs the HOME Menu's logo key from your own console, and without it the CIA keeps makerom's
+stock logo). Host tests:
 `app/test/run_tests.sh` (needs a C compiler and Python; ffmpeg for the audio tests).
 
 **Plugin tests:** `pip install -r plugin/requirements-dev.txt`, then `python -m pytest` in `plugin/`.

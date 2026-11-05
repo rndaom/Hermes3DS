@@ -48,17 +48,21 @@ ICON		:=	meta/icon.png
 # onto a console. Test builds stay below the first release, 0.1.0.
 VERSION_MAJOR	:=	0
 VERSION_MINOR	:=	1
-VERSION_MICRO	:=	0
+VERSION_MICRO	:=	1
 APP_VERSION	:=	$(VERSION_MAJOR).$(VERSION_MINOR).$(VERSION_MICRO)
 #---------------------------------------------------------------------------------
 # CIA (`make cia`, installs Hermes on the HOME Menu with FBI). Needs makerom and
 # bannertool on PATH. Art: meta/ (rebuild with tools/build_meta.py).
+# Boot logo: tools/build_logo.py builds the Hermes one into build/ when the HOME
+# Menu's logo key is in LOGO_KEY (python3 needed); without it makerom puts in its
+# stock Homebrew logo (the RSF's BasicInfo/Logo).
 #---------------------------------------------------------------------------------
 APP_PRODUCT_CODE	:=	CTR-H-HRMS
 APP_UNIQUE_ID	:=	0xF4E3D
 RSF			:=	meta/$(TARGET).rsf
 BANNER_IMAGE	:=	meta/banner.png
 BANNER_AUDIO	:=	meta/banner.wav
+LOGO_KEY	?=	$(HOME)/.3ds/logo_hmackey_text
 #GFXBUILD	:=	$(ROMFS)/gfx
 
 #---------------------------------------------------------------------------------
@@ -202,7 +206,13 @@ cia: all
 	@command -v makerom >/dev/null 2>&1 || { echo "makerom not found: get it from the Project_CTR releases and put it on PATH"; exit 1; }
 	@command -v bannertool >/dev/null 2>&1 || { echo "bannertool not found: get it from the 3ds-bannertool releases and put it on PATH"; exit 1; }
 	@bannertool makebanner -i $(BANNER_IMAGE) -a $(BANNER_AUDIO) -o $(BUILD)/banner.bnr
+	@rm -f $(BUILD)/logo.bin
+	@if [ -f "$(LOGO_KEY)" ]; then \
+		python3 $(CURDIR)/../tools/build_logo.py -o $(BUILD)/logo.bin --key-file "$(LOGO_KEY)" >/dev/null || exit 1; \
+		echo "boot logo: Hermes"; \
+	else echo "boot logo: stock Homebrew (no logo key in $(LOGO_KEY); see tools/build_logo.py)"; fi
 	@makerom -f cia -o $(OUTPUT).cia -target t -exefslogo -rsf $(RSF) -elf $(OUTPUT).elf \
+		$$([ -f $(BUILD)/logo.bin ] && echo "-logo $(BUILD)/logo.bin") \
 		-ver $$(( ($(VERSION_MAJOR) << 10) | ($(VERSION_MINOR) << 4) | $(VERSION_MICRO) )) \
 		-icon $(OUTPUT).smdh -banner $(BUILD)/banner.bnr \
 		-DAPP_TITLE="$(APP_TITLE)" -DAPP_PRODUCT_CODE="$(APP_PRODUCT_CODE)" \

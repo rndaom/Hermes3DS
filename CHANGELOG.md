@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.1 (2026-11-05)
+
+App only; the plugin is unchanged (0.1.0).
+
+- Hermes boot logo for the `.cia`: the splash the HOME Menu shows while Hermes starts (both screens, the banner's
+  wordmark in white and light blue on the Hermes blue) in place of makerom's stock "Homebrew" one. Built by
+  `tools/build_logo.py` when the HOME Menu's logo key is present (see its `--find-key`).
+
 ## 0.1.0 (2026-11-04)
 
 First public release.
