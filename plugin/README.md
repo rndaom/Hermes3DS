@@ -14,9 +14,11 @@ in the [main README](../README.md).
 ## Install
 
 ```bash
-hermes plugins install 3ds-platform
+hermes plugins install rndaom/Hermes3DS#plugin
 hermes plugins enable 3ds-platform
 ```
+
+Once the plugin is in the Hermes plugin catalog, `hermes plugins install 3ds-platform` works too.
 
 Turn the platform on in `~/.hermes/config.yaml`, together with streaming (off by default in Hermes):
 

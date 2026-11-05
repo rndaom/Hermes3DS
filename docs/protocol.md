@@ -1,4 +1,4 @@
-# Hermes 3DS wire protocol — v1 (draft)
+# Hermes 3DS wire protocol, v1
 
 The 3DS app (client) talks to the `3ds` platform plugin inside `hermes gateway` (server).
 The plugin does all heavy work (formatting, transcoding, paging); the 3DS only displays and sends input.

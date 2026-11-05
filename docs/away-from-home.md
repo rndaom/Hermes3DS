@@ -40,9 +40,8 @@ right corner of the 3DS screen says **LAN** at home and **AWAY** when it is goin
 | Ports 443, 8443 and 10000 are all used | Funnel only offers those three ports and other services on this PC took them. Free one, or pick it with `away_public_port`. |
 
 If `hermes 3ds away` says ready but the 3DS still can't connect away from home: open Hermes on the 3DS once
-**at home** after setting up Tailscale (that is when it learns the address), check the status bar says
-**AWAY** is being tried (the More tab shows "away ready"), and remember the 3DS can't use networks with a
-sign-in page. The 3DS log (`sdmc:/3ds/hermes/log.txt`) has a `TLS to ...` or `away route failed` line with the
+**at home** after setting up Tailscale (that is when it learns the address; the More tab then shows "away ready"),
+and remember the 3DS can't use networks with a sign-in page. The 3DS log (`sdmc:/3ds/hermes/log.txt`) has a `TLS to ...` or `away route failed` line with the
 reason. A brand-new Funnel can take a few minutes before the internet reaches it.
 
 ## Good to know
