@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.3 (2026-11-06)
+
+Plugin only; the app is unchanged apart from its version number.
+
+- Approvals answer their own request. On Hermes 0.23 and newer each approval card on the 3DS carries the id of the
+  command it asks about, so tapping a card that is no longer waiting (it timed out, or `/approve` answered it)
+  approves nothing, and the card closes as timed out, instead of answering the next command waiting in that
+  session. On Hermes 0.22 approvals resolve oldest first, as before.
+
 ## 0.1.2 (2026-11-05)
 
 App only; the plugin is unchanged (0.1.0).

@@ -48,7 +48,7 @@ ICON		:=	meta/icon.png
 # onto a console. Test builds stay below the first release, 0.1.0.
 VERSION_MAJOR	:=	0
 VERSION_MINOR	:=	1
-VERSION_MICRO	:=	2
+VERSION_MICRO	:=	3
 APP_VERSION	:=	$(VERSION_MAJOR).$(VERSION_MINOR).$(VERSION_MICRO)
 #---------------------------------------------------------------------------------
 # CIA (`make cia`, installs Hermes on the HOME Menu with FBI). Needs makerom and

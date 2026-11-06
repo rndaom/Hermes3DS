@@ -188,7 +188,7 @@ class ThreeDSAdapter(BasePlatformAdapter):
         self._queued: dict[str, int] = {}  # chat_id -> messages sent while a turn was running, for `status`
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._trace_path = None
-        self._approval_cards: dict[str, tuple[str, str]] = {}  # card mid -> (chat_id, session_key)
+        self._approval_cards: dict[str, tuple[str, str, Optional[str]]] = {}  # card mid -> (chat_id, session_key, request_id)
         self._blobs: Optional[BlobStore] = None
         self._awaiting_heard: dict[str, list[tuple[float, int]]] = {}  # chat_id -> [(sent at, send request id)]
 
@@ -734,7 +734,8 @@ class ThreeDSAdapter(BasePlatformAdapter):
         if key is None or self._server is None:
             return SendResult(success=False, error="unknown chat", error_kind="not_found")
         req = self._mid("a")
-        self._approval_cards[req] = (prompt.chat_id, prompt.session_key)
+        # Hermes 0.23+ names the request the card answers; 0.22.x sends no id (FIFO, below).
+        self._approval_cards[req] = (prompt.chat_id, prompt.session_key, getattr(prompt, "request_id", None))
         await self._server.set_pending(key, req, {
             "t": "approval", "req": req, "text": markdown_to_rich(_cut(prompt.text, 4000))[0],
             "command": _cut(prompt.command, 8000), "description": _cut(prompt.description, 1000), "actions": [list(a) for a in prompt.actions],
@@ -748,10 +749,15 @@ class ThreeDSAdapter(BasePlatformAdapter):
             raise RequestError("not_found", "approval already answered or expired")
         if choice not in ("once", "session", "always", "deny"):
             raise RequestError("bad_request", "choice must be once, session, always or deny")
-        # Hermes resolves approvals per session in FIFO order (as the Telegram/Discord buttons do).
-        n = resolve_gateway_approval(card[1], choice)
+        _, session_key, request_id = card
+        if request_id:  # only this card's request: a stale card can't answer the next one in the queue
+            n = resolve_gateway_approval(session_key, choice, request_id=request_id)
+        else:  # Hermes 0.22.x: per session, oldest first (as its own buttons did)
+            n = resolve_gateway_approval(session_key, choice)
         self._approval_cards.pop(req, None)
-        await self._server.clear_pending(device.key, req, {"t": "approval_done", "req": req, "choice": choice})
+        # n == 0: the request already settled (timed out, or /approve answered it), so nothing ran.
+        await self._server.clear_pending(device.key, req, {"t": "approval_done", "req": req,
+                                                           "choice": choice if n else "timeout"})
         return n
 
     async def send_clarify(self, chat_id: str, question: str, choices: Optional[list], clarify_id: str,

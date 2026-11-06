@@ -1,7 +1,7 @@
 name: 3ds-platform
 label: Nintendo 3DS
 kind: platform
-version: 0.1.0
+version: 0.1.3
 requires_hermes: ">=0.22.5"
 description: >
   Nintendo 3DS gateway adapter for Hermes Agent. Opens an encrypted TCP listener
