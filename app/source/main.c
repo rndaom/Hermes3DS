@@ -135,14 +135,17 @@ int main(void)
         float dt = app.now ? (now - app.now) / 1000.0f : 0;
         app.now = now;
         // Text being typed out gets every frame (smooth); spinners only need ~12 fps; idle draws nothing.
-        bool revealing = chat_tick(&app.chat, dt > 0.1f ? 0.1f : dt);
-        led_waiting(app.chat.approval || app.chat.clarify);
+        bool revealing = false;
+        for (int i = 0; i < app.nagents; i++)  // the other agents' replies keep typing out behind
+            if (chat_tick(&app.agents[i].chat, dt > 0.1f ? 0.1f : dt) && i == app.cur) revealing = true;
+        led_waiting(app_any_waiting());
         blob_tick();
         audio_tick();
         speak_tick();
         voice_tick();
         camera_tick();
         upload_tick();
+        app_tick();
         u64 t_draw = perf_now(), t_end = t_draw;
         bool drew = app.dirty || revealing || (app_animating() && now - last_draw >= ANIM_FRAME_MS);
         if (drew) {

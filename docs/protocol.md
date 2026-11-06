@@ -446,6 +446,45 @@ Client → server: voice messages and photos, §4.4.1.
 
 ---
 
+### 4.8 Bots (several agents on one connection)
+
+A Hermes gateway with `gateway.multiplex_profiles: true` serves its main profile plus every named profile under
+`~/.hermes/profiles/` (the "bots" of Hermes Bot Mode, which is a desktop view over the same profiles). Each is an
+agent with its own home: config and model, `.env`, SOUL, memory, skills, sessions and cron jobs. The 3DS has one
+chat with each.
+
+**The `agent` field.** Requests about one agent's chat carry an optional `agent`, the profile name: `send`, `stop`,
+`status`, `approve`, `answer`, `sessions.*`, `commands.list`, `models.list`, `skills.list`, `tools.list`, `jobs.*`.
+No `agent` (or `""`, or the main profile's own name) means the main agent, which is what an app from before bots
+sends, so it keeps working unchanged. The server runs the request in that profile (its session store, its skills,
+its jobs) and echoes the request's `agent` into the reply. Server events for a bot's chat (`msg`, `append`,
+`edit`, `delete`, `typing`, `tool`, `speak`, `heard`, `approval`, `approval_done`, `clarify`, `clarify_done`) carry
+its `agent`; the main
+agent's carry none. A name the gateway doesn't serve is `not_found`; a malformed one `bad_request`; a bot whose
+profile doesn't run the 3ds platform (`ready: false` below) is `unavailable` for every request: a profile is open to
+the 3DS only once it turns 3ds on. `approve` and `answer` are the exception: they name their prompt (`req`, `cid`)
+and are answered even for a bot that has left the gateway, so its cards can be cleared; when a bot leaves, the
+server settles its pending prompts itself (`approval_done` with `choice: "timeout"`, `clarify_done`).
+Uploads, blobs, `blob.open` and the roster requests below are the device's, not an agent's, and take no `agent`.
+
+On the PC each bot's chat is its own Hermes chat: chat id `dev:<fingerprint>/<profile>` (the main agent's stays
+`dev:<fingerprint>`), source `profile` set to the bot, session key `agent:<profile>:3ds:dm:dev:<fingerprint>/<profile>`.
+A multiplexed gateway builds one adapter per served profile and admits a profile's turns only through that
+profile's own adapter, so a bot's 3ds adapter binds no port: it attaches to the main profile's listener (one port,
+one pairing) and shares its state, and the listener hands the bot's messages to it; replies go out through it.
+Hermes loads each profile's own copy of the plugin (a cloned profile gets a copy), so the copies meet in a
+process-wide registry, and a copy of another plugin release is refused (`plugin_mismatch`, checked whichever of
+the two comes up first): update the plugin in every profile. A bot's adapter with no listener to attach to (the
+main profile doesn't run 3ds) fails with `no_listener`. Offline replay (§4.4) keeps each event's tag.
+
+| request | fields | response data |
+|---|---|---|
+| `agents.list` | — | `{items:[{id,title,desc,model,provider,primary,bot,busy,ready,voice?,avatar?}], multiplex}`: the main profile first (`primary`), then the bots. `title` is Bot Mode's name for it (`ui_meta.hermes-bots.title`), else `display_name` from `profile.yaml`, else the main agent's "Hermes" or the name made readable; `bot` says Bot Mode lists it. `busy`: a turn is running in this device's chat with it; `voice`: Hermes speaks its replies there (`/voice`); `ready`: the gateway has a 3DS adapter in that profile, so its turns have a way in (false: requests for it get `unavailable`). `avatar`: a blob ref (§5) to its picture, a 36×36 PNG with a see-through background: the photo Bot Mode set (`<profile>/assets/avatar.png`, `.jpg` or `.webp`, cover-cropped), else Bot Mode's `ui_meta.hermes-bots` `shape` (circle, squircle, pill, triangle, hexagon, cloud, drop) in its `color`, with two eyes; a profile nobody styled, or a generated look (blobatar, sigil, solid) this side can't draw, gets the shape and colour Bot Mode picks from its name. None for the main agent, or without Pillow on the PC. A picture is drawn once per look and its blob reused for a few days; a new look gets a new blob id. Without `multiplex` the list holds only the main agent. |
+| `agents.create` | `name, desc?` | `{item:{...as in agents.list}}`. Makes a profile with `hermes profile create <name> --clone-from <main> --no-alias [--description <desc>]` (what Bot Mode's New Agent does with "Copy API keys": config, `.env`, SOUL, skills and memory notes are copied; chats, sessions, cron jobs and messaging channels are not) then turns the 3ds platform on in it (`hermes -p <name> config set platforms.3ds.enabled true`: a clone has no `platforms:` section, and without it the bot couldn't be reached) and has the gateway serve it at once. `name` is turned into a profile id (`Research Buddy` → `research-buddy`, `[a-z0-9][a-z0-9_-]{0,63}`, not `default`, `main` or a name Hermes reserves). Answered beside the device's other requests (it can take a minute), so pings, sends and approvals keep flowing; the same request again within 10 minutes of a success (the reply was lost to a dropped connection) returns the same bot. `unavailable` when the gateway doesn't multiplex profiles or the `hermes` command fails (its last error line is the `msg`); `bad_request` for a bad, taken or reserved name, or one already being made. |
+
+An older plugin answers `agents.list` with `bad_request` ("unknown request"); the app then shows only the main
+agent and says the plugin needs an update.
+
 ## 5. Blobs
 
 Binary content (images, files, text previews, audio) moves as blobs, referenced from JSON as

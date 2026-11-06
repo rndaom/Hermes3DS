@@ -1,12 +1,13 @@
 name: 3ds-platform
 label: Nintendo 3DS
 kind: platform
-version: 0.1.3
+version: 0.2.0
 requires_hermes: ">=0.22.5"
 description: >
   Nintendo 3DS gateway adapter for Hermes Agent. Opens an encrypted TCP listener
   (Noise IK) that the Hermes 3DS homebrew app connects to: streaming chat, tool
-  progress, approvals, clarify, sessions, models, skills and cron.
+  progress, approvals, clarify, sessions, models, skills, cron, and a chat with
+  each Hermes profile (bots).
 author: Random
 optional_env:
   - name: THREEDS_PORT

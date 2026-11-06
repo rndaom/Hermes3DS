@@ -16,6 +16,9 @@ from stdin (or, with `--commands FILE`, lines appended to that file) to push eve
                              a reader preview; audio files become playable `audio` when ffmpeg is on PATH)
     voice <path> [caption]   an audio file as a spoken reply (`voice: true`: the 3DS may play it at once)
 
+    @<bot> <command>     any of the above in a bot's chat (protocol.md §4.8), e.g. `@research say hi`
+    bots on|off          whether the mock serves bots (`off`: as with gateway.multiplex_profiles off)
+
 Voice messages and photos from the 3DS (protocol.md §4.4.1) are saved in the mock's work folder (the path is
 printed) and answered with a `heard` event (voice) and a short reply describing what arrived.
     quit
@@ -43,6 +46,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "plugin"))
 
+from h3proto import avatar  # noqa: E402
 from h3proto.away import parse_address  # noqa: E402
 from h3proto.blobs import BlobStore  # noqa: E402
 from h3proto.media import build_attachment  # noqa: E402
@@ -55,6 +59,11 @@ ACTIONS = [["Allow once", "once", "primary"], ["This session", "session", ""], [
 SESSION = {"id": "mock-session", "title": "Mock PC", "model": "mock-model", "started": 0, "msgs": 0,
            "tokens_in": 0, "tokens_out": 0, "cost": 0}
 _ids = itertools.count(1)
+# The bots the mock serves (agents.list), after the main agent; agents.create adds to it. `ui` is Bot Mode's
+# `ui_meta.hermes-bots` look; without one a bot gets the shape and colour Bot Mode picks from its name.
+BOTS = [{"id": "research", "title": "Research", "desc": "Digs through papers and the web, cites its sources.",
+         "model": "mock-research", "ui": {"color": "#3d5afe", "shape": "hexagon"}},
+        {"id": "writer", "title": "Writer", "desc": "", "model": "mock-writer"}]
 
 
 def split_path(arg: str) -> tuple[str, str]:
@@ -73,6 +82,31 @@ class MockBackend:
         self.server: Hermes3DSServer | None = None
         self.device: Device | None = None
         self.blobs = blobs
+        self.multiplex = True
+        self.avatars: dict[str, dict] = {}
+
+    def _bot(self, msg: dict) -> str:
+        from h3proto.server import RequestError
+        name = msg.get("agent") or ""
+        if name in ("", "default"):
+            return ""
+        if not self.multiplex or name not in [b["id"] for b in BOTS]:
+            raise RequestError("not_found", f"no bot called {name} on this gateway")
+        return name
+
+    def _agents(self) -> dict:
+        main = {"id": "default", "title": "Hermes", "desc": "", "model": "mock-model", "provider": "mock",
+                "primary": True, "bot": False, "busy": False}
+        bots = [{"provider": "mock", "primary": False, "bot": True, "busy": False, "avatar": self._avatar(b),
+                 **{k: v for k, v in b.items() if k != "ui"}} for b in BOTS]
+        return {"t": "agents.list_r", "items": [main] + (bots if self.multiplex else []), "multiplex": self.multiplex}
+
+    def _avatar(self, bot: dict) -> dict | None:
+        if bot["id"] not in self.avatars:
+            png = avatar.render(avatar.look(bot["id"], self.blobs.root, bot.get("ui")))
+            if png:
+                self.avatars[bot["id"]] = self.blobs.put_bytes(png, "image/png", bot["id"] + ".png", "thumb")
+        return self.avatars.get(bot["id"])
 
     async def welcome_state(self, device: Device) -> dict:
         return {"chat_id": "mock", "session": dict(SESSION)}
@@ -87,6 +121,21 @@ class MockBackend:
     async def handle(self, device: Device, msg: dict) -> dict | None:
         t = msg["t"]
         print(f"<- {msg}", flush=True)
+        if t == "agents.list":
+            return self._agents()
+        if t == "agents.create":
+            from h3proto.server import RequestError
+            name = str(msg.get("name") or "")
+            if not self.multiplex:
+                raise RequestError("unavailable", "this gateway serves one profile (gateway.multiplex_profiles is off)")
+            if name in ("default", "main") or name in [b["id"] for b in BOTS]:
+                raise RequestError("bad_request", f"there is already a profile called {name}")
+            await asyncio.sleep(2)  # the real one copies a profile
+            BOTS.append({"id": name, "title": name.replace("-", " ").replace("_", " ").capitalize(),
+                         "desc": str(msg.get("desc") or ""), "model": "mock-model"})
+            item = {k: v for k, v in self._agents()["items"][-1].items() if k != "busy"}
+            return {"t": "agents.create_r", "item": item}
+        bot = self._bot(msg)
         if t == "approve":
             await self.server.clear_pending(device.key, str(msg.get("req")),
                                             {"t": "approval_done", "req": msg.get("req"), "choice": msg.get("choice")})
@@ -96,14 +145,18 @@ class MockBackend:
                                             {"t": "clarify_done", "cid": msg.get("cid")})
             return {"t": "answer_r", "ok": True}
         if t == "send" and (msg.get("voice") or msg.get("attach")):
-            return await self._media_send(device, msg)
+            return await self._media_send(device, msg, bot)
         if t == "send":
             mid = f"m{next(_ids)}"
-            await self.server.post_message(device.key, f"u{mid}", str(msg.get("text")), role="user")
-            await self.server.post_message(device.key, mid, f"(mock) you said: {msg.get('text')}")
+            who = f"mock {bot}" if bot else "mock"
+            await self.server.post_message(device.key, f"u{mid}", str(msg.get("text")), role="user", agent=bot)
+            await self.server.post_message(device.key, mid, f"({who}) you said: {msg.get('text')}", agent=bot)
             return {"t": "send_r", "mid": mid}
         if t == "status":
-            return {"t": "status_r", "now": time.time(), "session": dict(SESSION), "busy": False, "queued": 0}
+            sess = dict(SESSION)
+            if bot:
+                sess.update(id=f"mock-{bot}", title=f"Mock {bot}", model=f"mock-{bot}")
+            return {"t": "status_r", "now": time.time(), "session": sess, "busy": False, "queued": 0}
         if t == "models.list":
             return {"t": "models.list_r", "providers": []}
         if t.endswith(".list") or t == "sessions.messages":
@@ -112,7 +165,7 @@ class MockBackend:
             return {"t": f"{t}_r"}
         return None
 
-    async def _media_send(self, device: Device, msg: dict) -> dict:
+    async def _media_send(self, device: Device, msg: dict, bot: str = "") -> dict:
         """A voice message or photos: keep them where they can be looked at, and say what arrived."""
         from h3proto.audio import voice_to_wav
         from h3proto.server import RequestError
@@ -130,9 +183,9 @@ class MockBackend:
             peak = max((abs(v) for v in pcm), default=0)
             secs = len(pcm) / int(voice["rate"])
             print(f"voice message: {secs:.1f} s, peak {peak}, saved {out}", flush=True)
-            await self.server.event(device.key, {"t": "heard", "req": msg.get("id"),
-                                                 "text": f"(mock) {secs:.1f} seconds, loudest {peak * 100 // 32767}%"})
-            await self.server.post_message(device.key, mid, f"(mock) got your voice message: {secs:.1f} s.")
+            heard = {"t": "heard", "req": msg.get("id"), "text": f"(mock) {secs:.1f} seconds, loudest {peak * 100 // 32767}%"}
+            await self.server.event(device.key, {**heard, "agent": bot} if bot else heard)
+            await self.server.post_message(device.key, mid, f"(mock) got your voice message: {secs:.1f} s.", agent=bot)
         else:
             sizes = []
             for i, p in enumerate(paths):
@@ -147,7 +200,7 @@ class MockBackend:
                 print(f"photo: {out} ({p.stat().st_size} bytes, {sizes[-1]})", flush=True)
             caption = str(msg.get("text") or "").strip()
             await self.server.post_message(device.key, mid, f"(mock) got {len(paths)} photo(s): {', '.join(sizes)}" +
-                                           (f", caption \"{caption}\"" if caption else ""))
+                                           (f", caption \"{caption}\"" if caption else ""), agent=bot)
         return {"t": "send_r", "mid": mid}
 
     async def command(self, line: str) -> bool:
@@ -156,6 +209,14 @@ class MockBackend:
             return True
         if cmd == "quit":
             return False
+        if cmd == "bots":
+            self.multiplex = arg.strip() != "off"
+            print(f"bots {'on' if self.multiplex else 'off'}", flush=True)
+            return True
+        bot = ""
+        if cmd.startswith("@"):  # `@research say hi`: the rest is for that bot's chat
+            bot = cmd[1:]
+            cmd, _, arg = arg.strip().partition(" ")
         if cmd == "away":
             await self.server.set_away(None if arg.strip() in ("", "none") else parse_address(arg))
             print(f"away address: {self.server.away}", flush=True)
@@ -167,19 +228,19 @@ class MockBackend:
         if cmd == "approval":
             req = f"a{next(_ids)}"
             command = arg or "rm -rf ~/h3ds-approval-test"
-            await self.server.set_pending(key, req, {
+            await self.server.set_pending(key, req, tag({
                 "t": "approval", "req": req, "text": "Hermes wants to run a command", "command": command,
-                "description": "recursive delete", "actions": ACTIONS})
+                "description": "recursive delete", "actions": ACTIONS}, bot))
         elif cmd in ("clarify", "multi"):
             parts = [p.strip() for p in (arg or "Which one?|Red|Green|Blue").split("|")]
             cid = f"q{next(_ids)}"
-            await self.server.set_pending(key, f"c:{cid}", {
-                "t": "clarify", "cid": cid, "question": parts[0], "choices": parts[1:], "multi": cmd == "multi"})
+            await self.server.set_pending(key, f"c:{cid}", tag({
+                "t": "clarify", "cid": cid, "question": parts[0], "choices": parts[1:], "multi": cmd == "multi"}, bot))
         elif cmd == "say":
-            await self.server.post_message(key, f"m{next(_ids)}", arg)
+            await self.server.post_message(key, f"m{next(_ids)}", arg, agent=bot)
         elif cmd == "md":
             text, spans = markdown_to_rich(arg.replace("\\n", "\n"))
-            await self.server.post_message(key, f"m{next(_ids)}", text, spans=spans)
+            await self.server.post_message(key, f"m{next(_ids)}", text, spans=spans, agent=bot)
         elif cmd in ("image", "file", "voice"):
             path, caption = split_path(arg)
             if not Path(path).is_file():
@@ -190,12 +251,19 @@ class MockBackend:
             if cmd == "voice" and att.get("kind") == "audio":
                 att["voice"] = True
             print(f"attachment: {json.dumps(att)}", flush=True)
-            await self.server.post_message(key, f"m{next(_ids)}", caption, attach=[att])
+            await self.server.post_message(key, f"m{next(_ids)}", caption, attach=[att], agent=bot)
         elif cmd == "typing":
-            await self.server.set_typing(key, arg != "off")
+            await self.server.set_typing(key, arg != "off", bot)
         else:
             print(f"unknown command {cmd!r}", flush=True)
         return True
+
+
+def tag(ev: dict, bot: str) -> dict:
+    """A prompt for a bot's chat carries its name (protocol.md §4.8)."""
+    if bot:
+        ev["agent"] = bot
+    return ev
 
 
 async def _lines(path: Path | None):

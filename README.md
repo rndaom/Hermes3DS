@@ -46,6 +46,9 @@ These are real screens from the app, captured in an emulator with a scripted tes
 - **Chat:** streaming replies with formatting, colour emoji, tables and code; tool activity as it runs; Stop.
 - **Approvals and questions:** when Hermes asks to run a command or asks you something, the 3DS shows it (and
   blinks the notification LED) so you can allow, deny or answer.
+- **Bots:** chat with each of your Hermes profiles (the bots of Hermes Bot Mode) from the **Bots** tab, each in
+  its own chat with its own sessions, skills, jobs and model; make a new one from the 3DS. Needs
+  `gateway.multiplex_profiles: true` (see [Bots](#bots)).
 - **Sessions, skills, jobs, models:** browse and resume sessions, see skills and scheduled jobs, switch model,
   run slash commands from a grid.
 - **Files:** pictures, documents (text, Markdown, code, PDF, Office), and audio sent by Hermes open in a
@@ -137,7 +140,7 @@ To remove a 3DS: `hermes 3ds devices`, then `hermes 3ds unpair <name>`.
 | Y (hold) | Record a voice message; release to send, B to cancel |
 | Y (tap) | Play or pause the latest audio |
 | X | Files in this chat |
-| L / R | Switch tabs: Chat, Sessions, Skills, Jobs, More |
+| L / R | Switch tabs: Chat, Bots, Sessions, Skills, Jobs, More |
 | Circle Pad / D-pad | Scroll |
 | SELECT | Look for the computer again |
 | START | Quit |
@@ -154,6 +157,44 @@ writing it, sending the 3DS the speech in parts of a few seconds that it plays o
 voice messages to the chat (`speech_groups: false` under `platforms.3ds` sends the whole reply as one voice
 message instead, when the model is done). Without it Hermes speaks the whole reply with its normal TTS provider
 afterwards. **VOICE** in the top bar shows that Spoken replies is on.
+
+## Bots
+
+A bot is a Hermes profile: its own model and settings, API keys, SOUL, memory, skills, sessions and scheduled jobs,
+under `~/.hermes/profiles/<name>/`. Hermes Bot Mode on the desktop shows the same ones. For the 3DS to reach them,
+the gateway has to serve them all, which it does with this in the main `~/.hermes/config.yaml`:
+
+```yaml
+gateway:
+  multiplex_profiles: true
+```
+
+Restart the gateway after changing it. The **Bots** tab then lists the main agent and every bot. Pick one with A:
+the Chat tab talks to it, and Sessions, Skills, Jobs and the model picker are its own. A bot replying while you are
+in another chat raises a dot on the Bots tab and a count on its row; a bot that needs an approval or an answer
+brings its chat up (or, when the chat you are in is waiting too, shows **NEEDS YOU** on its row). The app remembers
+the bot you had open. Each bot wears its Bot Mode picture: the photo you gave it, or its shape and colour.
+
+**X** on the Bots tab makes a new bot: give it a name (and, if you like, a description). It starts as a copy of the
+main agent (model, settings, API keys, SOUL, skills and memory notes; `hermes profile create --clone`) with empty
+chats and jobs, and shows up in Bot Mode too. It answers through the same listener and pairing; the plugin turns
+the 3ds platform on in its profile for you.
+
+A bot made another way (Bot Mode's New Agent, `hermes profile create`) is copied without its messaging channels, so
+turn 3ds on in it once, then restart the gateway:
+
+```bash
+hermes -p <name> config set platforms.3ds.enabled true
+```
+
+Until then the 3DS lists it as not reachable and can't open its chats, sessions, skills or jobs.
+
+Hermes keeps a copy of each plugin in every profile, so after `hermes plugins update 3ds-platform` update the bots'
+copies too, then restart the gateway (a bot on another release is refused and shows as not reachable):
+
+```bash
+hermes -p <name> plugins update 3ds-platform
+```
 
 ## Away from home
 

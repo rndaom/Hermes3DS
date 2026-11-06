@@ -5,6 +5,7 @@
 #include <citro2d.h>
 #include <stdbool.h>
 
+#include "blob.h"
 #include "chat.h"
 #include "net.h"
 #include "store.h"
@@ -36,7 +37,35 @@
 typedef enum { SCR_PAIR, SCR_CHAT } Screen;
 
 // Bottom-screen tabs (SCR_CHAT only). L/R or a tap switches them.
-typedef enum { TAB_CHAT, TAB_SESSIONS, TAB_SKILLS, TAB_JOBS, TAB_MORE, TAB_COUNT } Tab;
+typedef enum { TAB_CHAT, TAB_BOTS, TAB_SESSIONS, TAB_SKILLS, TAB_JOBS, TAB_MORE, TAB_COUNT } Tab;
+
+// The agents this 3DS can talk to (protocol.md §4.8): the main Hermes agent, then the bots, which are Hermes
+// profiles the gateway also serves (Bot Mode shows the same ones). Each has its own chat; the Sessions, Skills
+// and Jobs tabs and the model picker follow the one selected.
+#define AGENT_MAX 12
+typedef struct {
+    char id[68];       // profile name on the wire; "" for the main agent until the roster names it
+    char title[64];    // what the roster calls it ("Hermes" for the main agent)
+    char desc[480];
+    char model[64];
+    BlobRef avatar;    // its Bot Mode picture (a PNG blob) when has_avatar
+    bool has_avatar;
+    bool primary;
+    bool listed;       // in the last agents.list
+    bool unreachable;  // listed, but the PC has no 3DS connection into its profile (`ready: false`)
+    bool voice_known;  // the PC said whether Hermes speaks its replies in this chat (/voice)...
+    bool voice;        // ...and this is what it said
+    bool voice_synced; // /voice was brought in line with Spoken replies on this connection
+    bool status_asked; // a status was asked for on this connection
+    bool history_asked;
+    uint32_t history_req; // the sessions.messages for its chat in flight (others' replies are a tab's preview)
+    char draft[3072];     // what was typed for it and not sent
+    int unread;        // replies that arrived while another agent was selected
+    // The approval and question last seen in its chat: the PC re-sends pending ones after a reconnect, and those
+    // mustn't switch chats or sound again.
+    char seen_req[72], seen_cid[72];
+    Chat chat;
+} Agent;
 
 typedef enum {
     PAIR_SCAN,     // discovery running
@@ -53,7 +82,19 @@ typedef struct {
     bool dirty;
     u64 now;
 
-    Chat chat;
+    Agent agents[AGENT_MAX];
+    int nagents;           // agents[0] is the main agent
+    int cur;               // the agent selected
+    Chat *chat;            // &agents[cur].chat
+    bool agents_loaded;    // the PC answered agents.list
+    bool agents_old;       // ...with bad_request: a plugin from before bots
+    bool agents_restored;  // the bot selected last time was looked for in the roster
+    uint32_t agents_req;   // agents.list in flight
+    bool multiplex;        // the gateway serves several profiles (without it there are no bots)
+    int agents_more;       // bots the PC lists that don't fit in agents[]
+    char agents_err[120];  // why the last agents.list failed ("" once one worked)
+    u64 agents_retry_at;   // ask again at this time after a failure that may pass (0 = not planned)
+    u32 agents_retry_ms;
     ServerInfo server;
     bool have_server;
     NetState net;
@@ -66,7 +107,6 @@ typedef struct {
     uint32_t next_id;
     char device[64];
     long tz_off;           // 3DS clock (local time) minus Unix time, from status_r `now`
-    bool session_switch;   // the session changed: show its history once it loads
     char switch_name[96];  // what the Sessions tab called the session being resumed
 
     // pairing
@@ -85,7 +125,7 @@ typedef struct {
     float scroll;      // pixels above the bottom (0 = follow new text)
     float content_h;
     float view_h;
-    char draft[3072];
+    u64 chat_shown_at;     // when the chat showing became the selected agent's (question panels arm after it)
     char toast[96];
     u64 toast_until;
     Settings settings;
@@ -97,6 +137,19 @@ extern App app;
 uint32_t app_request(const char *t, json_t *fields);  // sends {t, id, ...fields}; returns the id
 void app_toast(const char *msg);
 void app_send_text(const char *text);  // a chat message or slash command, shown in the transcript
+// Agents (protocol.md §4.8). Requests app_request makes for the selected agent carry its name when it is a bot.
+Agent *app_agent(void);                        // the selected one
+bool app_is_current(const json_t *msg);        // an event or reply for the selected agent
+uint32_t app_request_for(const Agent *a, const char *t, json_t *fields);
+void app_refresh_agents(void);                 // asks the PC for the roster
+Agent *agent_by_id(const char *id);            // "" is the main agent; NULL when the 3DS doesn't keep it
+const char *agent_title(const Agent *a);       // never empty
+void app_select_agent(int i);                  // show agent i's chat; the tabs follow it
+void app_agents_reply(json_t *msg);            // agents.list_r
+// agents.create_r: selects the new bot unless you are busy here. 1: selected; 0: it waits in Bots; -1: no room
+// for it on the 3DS (every slot holds the chat showing or a question).
+int app_agent_created(const json_t *item);
+bool app_any_waiting(void);                    // some agent waits for an approval or an answer
 // System keyboard; false when cancelled (out then holds what was typed).
 bool app_keyboard(const char *hint, const char *initial, char *out, size_t cap, int maxlen, bool multiline,
                   const char *ok_label);
@@ -116,6 +169,7 @@ void app_init(void);
 void app_exit(void);
 void app_handle_event(NetEvent *ev);
 void app_input(void);
+void app_tick(void);       // once a frame: timed retries
 bool app_animating(void);  // spinner / caret / toast need redraws
 
 void draw_init(void);
@@ -142,7 +196,7 @@ extern const char *const APPR_CHOICE[APPR_N];
 #define CLAR_ROWS 5  // clarify choices the bottom panel shows at once (it scrolls past that)
 
 typedef struct {
-    Rect tabs[5];
+    Rect tabs[TAB_COUNT];
     Rect appr[APPR_N];  // approval panel buttons (w == 0: not offered)
     // Clarify panel: question top, then choice rows clar[0..clar_rows) showing choices clar_first.., then
     // "Type an answer" (and, for multi-select, "Send") along the bottom.

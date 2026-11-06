@@ -355,7 +355,7 @@ void voice_draw_bottom(void)
     rect(px, ry, pw, rh, COL_PAPER);
     frame_rect(px, ry, pw, rh, COL_RULE);
     text_draw("Speak replies aloud", px + 10, ry + 4, S_SMALL, COL_INK);
-    text_draw("Hermes answers through the 3DS speakers", px + 10, ry + 18, S_TOOL, COL_INK_3);
+    text_draw("Replies play through the 3DS speakers", px + 10, ry + 18, S_TOOL, COL_INK_3);
     bool on = app.settings.speak_replies;
     float sx = px + pw - 36;
     rect(sx, ry + 9, 26, 14, on ? COL_BLUE : COL_RULE);

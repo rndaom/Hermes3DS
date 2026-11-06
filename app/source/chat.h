@@ -63,6 +63,7 @@ typedef struct {
     char model[48];
     char session_id[64];
     bool history_loaded;
+    bool session_switch; // the session changed: show its history once it loads
     bool want_status;  // UI should send a `status` request (turn ended / new session)
     bool replied;      // a live assistant reply just finished (the app plays a sound and clears it)
     unsigned version;  // bumped on every change

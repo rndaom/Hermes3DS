@@ -1,4 +1,4 @@
-// Sessions, Skills, Jobs and More (design/mockups: Sessions, Commands). The bottom screen holds the list or
+// Bots, Sessions, Skills, Jobs and More (design/mockups: Sessions, Commands). The bottom screen holds the list or
 // grid; the top screen shows the selected item. Lists come from protocol.md §4.6 requests and are
 // refetched when a tab opens if they are older than a minute or the connection was re-made.
 #include "tabs.h"
@@ -51,6 +51,15 @@ static u64 preview_due;      // fetch the preview at this time (debounces fast s
 static bool picker;          // More: the model picker is open on the top screen
 static int cat, cell;        // More: command category and grid cell
 static u64 yolo_armed;       // More: /yolo needs a second press
+
+// Bots: the roster lives in app.agents (app.c); this is the tab's own state.
+typedef enum { BOTS_LIST, BOTS_CONFIRM, BOTS_CREATING } BotsStep;
+static BotsStep bstep;
+static int bot_sel, bot_top;
+static char bot_sel_id[68];  // the selected row's agent ("" = main), which a new roster may move
+static void bots_select(int i);
+static uint32_t create_req;
+static char new_name[68], new_desc[400], create_err[200];
 
 static int count(int k) { return (int)json_array_size(lists[k].items); }
 static json_t *item(int k, int i) { return json_array_get(lists[k].items, (size_t)i); }
@@ -124,14 +133,44 @@ bool tabs_handle(json_t *msg)
 {
     const char *t = jstr(msg, "t");
     if (!strcmp(t, "status_r")) {
-        json_decref(status);
-        status = json_incref(msg);
+        if (app_is_current(msg)) {
+            json_decref(status);
+            status = json_incref(msg);
+        }
         return false;  // app.c uses it too
     }
     uint32_t id = (uint32_t)json_integer_value(json_object_get(msg, "id"));
     if (!id) return false;
     bool error = !strcmp(t, "error");
     const char *emsg = jstr(msg, "msg")[0] ? jstr(msg, "msg") : jstr(msg, "code");
+    if (id == create_req) {
+        create_req = 0;
+        char buf[160], name[51];
+        if (error) {
+            utf8_copy(create_err, sizeof create_err, emsg);
+            bstep = BOTS_CONFIRM;  // (the Bots tab shows why; elsewhere a toast says it)
+            if (app.tab != TAB_BOTS) {
+                snprintf(buf, sizeof buf, "Couldn't make %s: %s", new_name, emsg);
+                app_toast(buf);
+            }
+        } else {
+            json_t *it = json_object_get(msg, "item");
+            utf8_copy(name, sizeof name, jstr(it, "title")[0] ? jstr(it, "title") : jstr(it, "id"));
+            bstep = BOTS_LIST;
+            int placed = app_agent_created(it);
+            if (placed > 0) {
+                snprintf(buf, sizeof buf, "%s is ready", name);
+                if (app.tab == TAB_BOTS) tabs_switch(TAB_CHAT);  // (not when you went on to another tab)
+            } else if (!placed) {  // you're answering something here: it waits in Bots
+                snprintf(buf, sizeof buf, "%s is ready: see Bots", name);
+            } else {
+                snprintf(buf, sizeof buf, "%s is ready, but the 3DS has no room for another bot", name);
+            }
+            app_toast(buf);
+        }
+        app.dirty = true;
+        return true;
+    }
     for (int k = 0; k < LS_N; k++) {
         List *l = &lists[k];
         if (l->req != id) continue;
@@ -174,7 +213,33 @@ void tabs_online(void)
         lists[k].req = 0;  // replies to the old connection never come
     }
     act_req = 0;
+    if (create_req) {  // the bot may exist now: the roster says
+        create_req = 0;
+        bstep = BOTS_LIST;
+    }
     if (app.tab != TAB_CHAT) tabs_switch(app.tab);
+}
+
+void tabs_agent_changed(void)
+{
+    for (int k = 0; k < LS_N; k++) {
+        List *l = &lists[k];
+        json_decref(l->items);
+        l->items = NULL;
+        l->req = 0;  // a reply for the agent before is dropped
+        l->loaded = l->stale = false;
+        l->err[0] = 0;
+        l->sel = l->top = 0;
+    }
+    json_decref(status);
+    status = NULL;
+    preview_sid[0] = 0;
+    preview_due = 0;
+    sess_q[0] = 0;
+    picker = false;
+    yolo_armed = 0;           // a second /yolo press counts for the same agent only
+    app.switch_name[0] = 0;  // a resume asked for in the other agent's Sessions
+    if (app.tab != TAB_CHAT && app.tab != TAB_BOTS) tabs_switch(app.tab);
 }
 
 void tabs_switch(Tab t)
@@ -182,8 +247,13 @@ void tabs_switch(Tab t)
     app.tab = t;
     app.dirty = true;
     picker = false;
+    if (t != TAB_BOTS && bstep == BOTS_CONFIRM) bstep = BOTS_LIST;
     switch (t) {
     case TAB_CHAT: break;
+    case TAB_BOTS:
+        bots_select(app.cur);
+        app_refresh_agents();
+        break;
     case TAB_SESSIONS:
         refresh(LS_SESSIONS);  // always: the current session and its title move
         break;
@@ -201,6 +271,11 @@ bool tabs_animating(void)
 {
     for (int k = 0; k < LS_N; k++)
         if (lists[k].req) return true;
+    if (app.tab == TAB_BOTS) {
+        if (app.agents_req || create_req) return true;
+        for (int i = 0; i < app.nagents; i++)
+            if (app.agents[i].chat.typing) return true;
+    }
     return preview_due || act_req || yolo_armed > osGetTime();
 }
 
@@ -613,7 +688,7 @@ static void sessions_top(void)
         float x = PAD_X + tag(cur ? "CURRENT" : "SESSION", PAD_X, 24, cur) + 6;
         when_text(jnum(it, "last_active"), when, sizeof when);
         int msgs = (int)jnum(it, "msgs");
-        const char *model = cur && app.chat.model[0] ? app.chat.model : jstr(it, "model");  // live, not stored
+        const char *model = cur && app.chat->model[0] ? app.chat->model : jstr(it, "model");  // live, not stored
         snprintf(meta, sizeof meta, "%s%s%d message%s%s%s", when, when[0] ? " · " : "", msgs, msgs == 1 ? "" : "s",
                  model[0] ? " · " : "", model);
         text_draw_fit(meta, x, 24.5f, S_TOOL, COL_TX_3, TOP_W - PAD_X - x);
@@ -723,8 +798,9 @@ static void skills_top(void)
                   PAD_X, y + 18, S_SMALL, on ? COL_TX_2 : COL_BAD);
     } else {
         big_title("Skills", 30);
-        text_block("What Hermes knows how to do. Each one is also a slash command.", PAD_X, 64,
-                   TOP_W - 2 * PAD_X, S_BODY, &BODY_COLORS, 3, NULL);
+        char what[128];
+        snprintf(what, sizeof what, "What %s knows how to do. Each one is also a slash command.", agent_title(app_agent()));
+        text_block(what, PAD_X, 64, TOP_W - 2 * PAD_X, S_BODY, &BODY_COLORS, 3, NULL);
     }
     draw_header(buf);
     top_footer(it ? "Use" : NULL, NULL, "Refresh");
@@ -816,9 +892,10 @@ static void jobs_top(void)
         if (err[0]) text_block(err, PAD_X, y + 64, TOP_W - 2 * PAD_X, S_SMALL, &DIM_COLORS, 4, NULL);
     } else {
         big_title("Nothing scheduled", 30);
-        text_block("Hermes can run prompts on a schedule and send the results here, even while the 3DS is "
-                   "closed: they wait for you and arrive when you reconnect.",
-                   PAD_X, 64, TOP_W - 2 * PAD_X, S_BODY, &BODY_COLORS, 5, NULL);
+        char what[200];
+        snprintf(what, sizeof what, "%s can run prompts on a schedule and send the results here, even while the 3DS "
+                 "is closed: they wait for you and arrive when you reconnect.", agent_title(app_agent()));
+        text_block(what, PAD_X, 64, TOP_W - 2 * PAD_X, S_BODY, &BODY_COLORS, 5, NULL);
     }
     draw_header(buf);
     top_footer(it ? "Run now" : NULL, it ? (job_paused(it) ? "Resume" : "Pause") : NULL, "Refresh");
@@ -1007,7 +1084,7 @@ static void more_top(void)
     } else {
         const char *title = jstr(s, "title");
         kv("SESSION", title[0] ? title : jstr(s, "id"), y, COL_INK);
-        kv("MODEL", jstr(s, "model")[0] ? jstr(s, "model") : app.chat.model, y + 17, COL_INK);
+        kv("MODEL", jstr(s, "model")[0] ? jstr(s, "model") : app.chat->model, y + 17, COL_INK);
         snprintf(buf, sizeof buf, "%d · tokens %d in, %d out", (int)jnum(s, "msgs"), (int)jnum(s, "tokens_in"),
                  (int)jnum(s, "tokens_out"));
         kv("MESSAGES", buf, y + 34, COL_INK);
@@ -1039,11 +1116,425 @@ static void more_top(void)
                "Type a command");
 }
 
+
+// --- Bots ---------------------------------------------------------------------
+// Hermes profiles the gateway serves, as Bot Mode shows them (protocol.md §4.8). A picks one: the chat, the
+// Sessions, Skills and Jobs tabs and the model picker are then that bot's.
+
+#define BOTS_Y 66
+#define BOTS_ROWS 5
+static const Rect NEW_BOT = {214, 33, 98, 26};
+// The new-bot step on the touch screen: the top screen explains, these act
+static const Rect BOT_CREATE = {16, 96, 288, 40}, BOT_DESC = {16, 146, 140, 32}, BOT_CANCEL = {164, 146, 140, 32},
+                  BOT_BACK = {90, 146, 140, 32};
+
+static bool asks(const Agent *a) { return a->chat.approval || a->chat.clarify; }
+
+// What the gateway can't do, in words, or NULL when bots work.
+static const char *bots_trouble(void)
+{
+    if (app.agents_old)
+        return "The Hermes 3DS plugin on the PC predates bots. Update it to chat with your Hermes profiles here.";
+    if (app.agents_loaded && !app.multiplex)
+        return "Bots are Hermes profiles. To reach them from the 3DS, set gateway.multiplex_profiles: true in the "
+               "PC's config.yaml and restart the gateway.";
+    return NULL;
+}
+
+static void bot_row(int i, const Rect *r, bool sel)
+{
+    const Agent *a = &app.agents[i];
+    bool cur = i == app.cur;
+    // Its picture, ringed for the agent in use; else a monogram box, filled for the agent in use.
+    float bx = r->x + 8, by = r->y + 6;
+    if (agent_picture(a, bx, by, 18)) {
+        if (cur) {
+            frame_rect(bx - 2, by - 2, 22, 22, COL_BLUE);
+            frame_rect(bx - 1, by - 1, 20, 20, COL_BLUE);
+        }
+    } else {
+        if (cur) rect(bx, by, 18, 18, COL_BLUE);
+        else frame_rect(bx, by, 18, 18, COL_LINE_B);
+        agent_mark(a, bx + 4.5f, by + 4.5f, cur ? COL_ON : COL_BLUE);
+    }
+    // Right: what it needs from you, or what it is doing.
+    float right = r->x + r->w - 10;
+    char buf[32];
+    if (asks(a)) {
+        float w = spaced_width("NEEDS YOU", S_EYE, 1.2f) + 8;
+        rect(right - w, r->y + 9, w, 12, COL_ACCENT);
+        frame_rect(right - w, r->y + 9, w, 12, COL_INK);
+        spaced("NEEDS YOU", right - w + 4, r->y + 11, S_EYE, COL_INK, 1.2f);
+        right -= w + 6;
+    } else if (a->chat.typing) {
+        float w = text_width("working", 7, S_TOOL);
+        text_draw("working", right - w, r->y + 10, S_TOOL, COL_BLUE);
+        braille(right - w - 10, r->y + 11, 9, COL_BLUE);
+        right -= w + 16;
+    } else if (a->unread) {
+        snprintf(buf, sizeof buf, "%d", a->unread > 99 ? 99 : a->unread);
+        float w = text_width(buf, strlen(buf), S_TOOL) + 8;
+        if (w < 14) w = 14;
+        rect(right - w, r->y + 8, w, 14, COL_BLUE);
+        text_draw(buf, right - w + (w - text_width(buf, strlen(buf), S_TOOL)) / 2, r->y + 9.5f, S_TOOL, COL_ON);
+        right -= w + 6;
+    } else if (a->unreachable) {
+        float w = text_width("not reachable", 13, S_TOOL);
+        text_draw("not reachable", right - w, r->y + 10, S_TOOL, COL_BAD);
+        right -= w + 6;
+    } else if (cur) {
+        float w = text_width("current", 7, S_TOOL);
+        text_draw("current", right - w, r->y + 10, S_TOOL, COL_BLUE);
+        right -= w + 6;
+    }
+    float tx = r->x + 34, tw = right - tx;
+    const char *sub = a->chat.model[0] ? a->chat.model : a->model[0] ? a->model : a->desc;
+    text_draw_fit(agent_title(a), tx, r->y + 3, S_BODY * 0.95f, sel || cur ? COL_INK : COL_INK_2, tw);
+    if (a != app.agents) {
+        snprintf(buf, sizeof buf, "@%s", a->id);
+        float iw = text_width(buf, strlen(buf), S_TOOL);
+        if (iw > tw * 0.55f) iw = tw * 0.55f;
+        text_draw_fit(buf, tx, r->y + 17, S_TOOL, COL_BLUE, iw);
+        if (sub[0]) text_draw_fit(sub, tx + iw + 6, r->y + 17, S_TOOL, COL_TX_3, tw - iw - 6);
+    } else {
+        text_draw_fit(sub[0] ? sub : "main agent", tx, r->y + 17, S_TOOL, COL_TX_3, tw);
+    }
+}
+
+static void bots_clamp(void)
+{
+    for (int i = 0; i < app.nagents; i++)  // follow the selected agent through a reordered roster
+        if (!strcmp(i ? app.agents[i].id : "", bot_sel_id)) bot_sel = i;
+    if (bot_sel >= app.nagents) bot_sel = app.nagents - 1;
+    if (bot_sel < 0) bot_sel = 0;
+    if (bot_sel < bot_top) bot_top = bot_sel;
+    if (bot_sel >= bot_top + BOTS_ROWS) bot_top = bot_sel - BOTS_ROWS + 1;
+    if (bot_top > app.nagents - BOTS_ROWS) bot_top = app.nagents - BOTS_ROWS;
+    if (bot_top < 0) bot_top = 0;
+    snprintf(bot_sel_id, sizeof bot_sel_id, "%s", bot_sel ? app.agents[bot_sel].id : "");
+}
+
+static void bots_select(int i)
+{
+    bot_sel = i < 0 ? 0 : i;
+    bot_sel_id[0] = 1;  // matches nothing: bots_clamp keeps the index and records its id
+    bot_sel_id[1] = 0;
+    bots_clamp();
+}
+
+static void open_bot(void)
+{
+    bots_clamp();
+    app_select_agent(bot_sel);
+    tabs_switch(TAB_CHAT);
+}
+
+// The new-bot flow: a name, then a confirmation on the top screen (with an optional description).
+static void slug(const char *in, char *out, size_t cap)
+{
+    size_t n = 0;
+    bool dash = false;
+    for (const char *p = in; *p && n + 1 < cap && n < 64; p++) {
+        char c = *p >= 'A' && *p <= 'Z' ? (char)(*p + 32) : *p;
+        if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' || c == '-') {
+            if (c == '-' && (dash || !n)) continue;
+            if (c == '_' && !n) continue;
+            out[n++] = c;
+            dash = c == '-';
+        } else if (n && !dash) {
+            out[n++] = '-';
+            dash = true;
+        }
+    }
+    while (n && (out[n - 1] == '-' || out[n - 1] == '_')) n--;
+    out[n] = 0;
+}
+
+static void new_bot(void)
+{
+    char buf[200], id[68];
+    const char *why = app.net != NET_ONLINE      ? "Not connected to the PC"
+                      : app.agents_old           ? "Update the plugin on the PC first"
+                      : !app.agents_loaded       ? (app.agents_err[0] ? "The PC couldn't list its bots yet; try again soon"
+                                                                      : "Still asking the PC about its bots")
+                      : !app.multiplex           ? "Turn on gateway.multiplex_profiles first"
+                                                 : NULL;
+    if (!why && app.nagents == AGENT_MAX) {
+        snprintf(buf, sizeof buf, "No room for more: the 3DS keeps %d bots", AGENT_MAX - 1);
+        why = buf;
+    }
+    if (create_req) {
+        snprintf(buf, sizeof buf, "Still making %s on the PC", new_name);
+        why = buf;
+    }
+    if (why) {
+        app_toast(why);
+        return;
+    }
+    if (!app_keyboard("Name for the new bot, like research or work-helper", NULL, buf, sizeof buf, 40, false, "Next"))
+        return;
+    slug(buf, id, sizeof id);
+    if (!id[0]) {
+        app_toast("Use letters or digits (a-z, 0-9) in the name");
+        return;
+    }
+    if (!strcmp(id, "default") || !strcmp(id, "main") || !strcmp(id, app.agents[0].id)) {
+        snprintf(buf, sizeof buf, "\"%s\" is the main agent's name: pick another", id);
+        app_toast(buf);
+        return;
+    }
+    if (agent_by_id(id)) {
+        snprintf(buf, sizeof buf, "There is a bot called %s already", id);
+        app_toast(buf);
+        return;
+    }
+    snprintf(new_name, sizeof new_name, "%s", id);
+    new_desc[0] = create_err[0] = 0;
+    bstep = BOTS_CONFIRM;
+}
+
+static void describe_bot(void)
+{
+    char buf[sizeof new_desc];
+    if (app_keyboard("What is this bot for? (shown in Bot Mode)", new_desc, buf, sizeof buf, 120, true, "OK"))
+        snprintf(new_desc, sizeof new_desc, "%s", buf);
+}
+
+static void create_bot(void)
+{
+    if (create_req || app.net != NET_ONLINE) {
+        if (app.net != NET_ONLINE) app_toast("Not connected to the PC");
+        return;
+    }
+    json_t *f = json_pack("{s:s, s:s}", "name", new_name, "desc", new_desc);
+    if (!f) return;
+    create_req = app_request("agents.create", f);
+    create_err[0] = 0;
+    bstep = BOTS_CREATING;
+}
+
+static void bots_input(u32 down, u32 held, const touchPosition *t)
+{
+    if (bstep == BOTS_CREATING) {  // a few seconds: the PC copies the profile
+        if (app.net != NET_ONLINE) {
+            create_req = 0;
+            bstep = BOTS_CONFIRM;
+            snprintf(create_err, sizeof create_err,
+                     "The connection dropped while the PC was making it. Once it is back, the list shows whether "
+                     "it was made.");
+        }
+        if ((down & KEY_B) || (t && rect_hit(&BOT_BACK, t->px, t->py))) bstep = BOTS_LIST;  // its reply still selects it
+        if (down & KEY_X) new_bot();  // (says it is still being made)
+        return;
+    }
+    if (bstep == BOTS_CONFIRM) {
+        if ((down & KEY_A) || (t && rect_hit(&BOT_CREATE, t->px, t->py))) create_bot();
+        else if ((down & KEY_X) || (t && rect_hit(&BOT_DESC, t->px, t->py))) describe_bot();
+        else if ((down & KEY_B) || (t && rect_hit(&BOT_CANCEL, t->px, t->py))) bstep = BOTS_LIST;
+        else return;
+        app.dirty = true;
+        return;
+    }
+    bots_clamp();
+    int old = bot_sel, to = bot_sel + nav_step(down, held, UP_KEYS, DOWN_KEYS);
+    if (down & KEY_DLEFT) to -= BOTS_ROWS;
+    if (down & KEY_DRIGHT) to += BOTS_ROWS;
+    if (to != old) {
+        bots_select(to);
+        app.dirty = true;
+    }
+    if (down & KEY_A) open_bot();
+    if (down & KEY_X) new_bot();
+    if (down & KEY_Y) app_refresh_agents();
+    if (down & KEY_B) tabs_switch(TAB_CHAT);
+    if (t) {
+        if (rect_hit(&NEW_BOT, t->px, t->py)) {
+            new_bot();
+        } else if (t->py >= BOTS_Y && t->py < BOTS_Y + BOTS_ROWS * ROW_H && t->px >= 8 && t->px < BOT_W - 8) {
+            int i = bot_top + (int)((t->py - BOTS_Y) / ROW_H);
+            if (i < app.nagents) {
+                if (i == bot_sel) open_bot();
+                else bots_select(i);
+            }
+        }
+    }
+}
+
+// The new bot isn't made until it is confirmed: say so on the touch screen too, with the buttons that do it.
+static void confirm_bottom(void)
+{
+    char buf[160];
+    spaced(bstep == BOTS_CREATING ? "CREATING" : "NEW BOT", 11, 36, S_EYE, COL_INK_2, 1.4f);
+    text_draw_fit(new_name, 11, 50, S_BODY * 1.2f, COL_INK, BOT_W - 22);
+    if (bstep == BOTS_CREATING) {
+        braille(16, 104, 10, COL_BLUE);
+        text_draw("Setting it up on the PC...", 30, 103, S_SMALL, COL_TX_2);
+        text_block("It shows up in the list when it's ready; you can go back meanwhile.", 16, 120, BOT_W - 32,
+                   S_SMALL, &DIM_COLORS, 2, NULL);
+        button(&BOT_BACK, "Back to the list", GLYPH_B, COL_PAPER_2, COL_INK);
+        return;
+    }
+    text_draw_fit("Not made yet: create it to add it to the list.", 11, 74, S_TOOL, COL_TX_3, BOT_W - 22);
+    snprintf(buf, sizeof buf, "Create %s", new_name);
+    if (text_width(buf, strlen(buf), S_SMALL) > BOT_CREATE.w - 30) snprintf(buf, sizeof buf, "Create it");
+    button(&BOT_CREATE, buf, GLYPH_A, COL_BLUE, COL_ON);
+    button(&BOT_DESC, new_desc[0] ? "Description" : "Add description", GLYPH_X, COL_PAPER_2, COL_INK);
+    button(&BOT_CANCEL, "Cancel", GLYPH_B, COL_PAPER_2, COL_INK);
+    if (create_err[0]) text_block(create_err, 16, 188, BOT_W - 32, S_SMALL, &DIM_COLORS, 4, NULL);
+}
+
+static void bots_bottom(void)
+{
+    char buf[160];
+    if (bstep != BOTS_LIST) {
+        confirm_bottom();
+        return;
+    }
+    bots_clamp();
+    snprintf(buf, sizeof buf, app.nagents == 1 ? "1 AGENT" : "%d AGENTS", app.nagents);
+    spaced(buf, 11, 36, S_EYE, COL_INK_2, 1.4f);
+    // Under it: a list that failed to refresh (it is asked for again), else bots that didn't fit.
+    float sw = NEW_BOT.x - 16 - 11;
+    if (app.agents_err[0] && !app.agents_old) {
+        snprintf(buf, sizeof buf, "Couldn't refresh: %s", app.agents_err);
+        text_draw_fit(buf, 11, 47, S_TOOL, COL_BAD, sw);
+    } else if (app.agents_more > 0) {
+        snprintf(buf, sizeof buf, "%d more on the PC (no room here)", app.agents_more);
+        text_draw_fit(buf, 11, 47, S_TOOL, COL_TX_3, sw);
+    } else {
+        text_draw("Each one keeps its own chats", 11, 47, S_TOOL, COL_TX_3);
+    }
+    bool can = !bots_trouble() && app.agents_loaded && app.nagents < AGENT_MAX;
+    button(&NEW_BOT, "+ New bot", NULL, can ? COL_BLUE : COL_PAPER_2, can ? COL_ON : COL_TX_3);
+    if (app.agents_req) braille(NEW_BOT.x - 14, NEW_BOT.y + 8, 9, COL_BLUE);
+
+    Rect p = {8, BOTS_Y, BOT_W - 16, BOTS_ROWS * ROW_H};
+    rect(p.x, p.y, p.w, p.h, COL_PAPER);
+    frame_rect(p.x, p.y, p.w, p.h, COL_RULE);
+    int shown = 0;
+    for (int i = 0; i < BOTS_ROWS && bot_top + i < app.nagents; i++, shown++) {
+        Rect r = {p.x, p.y + i * ROW_H, p.w, ROW_H};
+        int k = bot_top + i;
+        bool sel = k == bot_sel && bstep == BOTS_LIST;
+        if (i) rect(r.x + 1, r.y, r.w - 2, 1, COL_RULE);
+        if (sel) {
+            rect(r.x, r.y, r.w, r.h, COL_BLUE_SOFT);
+            frame_rect(r.x, r.y, r.w, r.h, COL_BLUE);
+            frame_rect(r.x + 1, r.y + 1, r.w - 2, r.h - 2, COL_BLUE);
+        }
+        if (k == app.cur) rect(r.x + 2, r.y + 2, 3, r.h - 4, COL_BLUE);
+        bot_row(k, &r, sel);
+    }
+    if (shown < BOTS_ROWS) {  // room under the rows: why there are no bots, or how to make one
+        const char *why = bots_trouble();
+        const char *s = why                    ? why
+                        : app.agents_loaded && app.nagents > 1
+                            ? "Press " GLYPH_X " to add another bot, or use Bot Mode in Hermes on the PC."
+                        : app.agents_loaded    ? "No bots yet. Press " GLYPH_X " to make one here, or use Bot Mode in "
+                                                 "Hermes on the PC."
+                        : app.net != NET_ONLINE ? "Connect to the PC to see its bots."
+                        : app.agents_err[0]     ? "The PC couldn't list its bots yet. Asking again shortly..."
+                                                : "Asking the PC about its bots...";
+        float y = p.y + shown * ROW_H + 8;
+        int lines = (int)((p.y + p.h - y) / 12);
+        if (!why && app.agents_loaded && app.nagents > 1 && lines < 2) s = "Press " GLYPH_X " to add another bot.";
+        rect(p.x + 1, y - 8, p.w - 2, 1, COL_RULE);
+        text_block(s, p.x + 12, y, p.w - 24, S_SMALL, why ? &DIM_COLORS : &BODY_COLORS, lines, NULL);
+    }
+    if (app.nagents > BOTS_ROWS) {  // scroll bar
+        float track = p.h - 4, h = track * BOTS_ROWS / app.nagents, pos = track * bot_top / app.nagents;
+        if (h < 8) h = 8;
+        rect(p.x + p.w - 4, p.y + 2 + pos, 2, h, COL_LINE_B);
+    }
+    text_draw(GLYPH_A " Chat · " GLYPH_X " New bot · " GLYPH_Y " Refresh", 11, BOTS_Y + BOTS_ROWS * ROW_H + 5, S_TOOL,
+              COL_TX_3);
+}
+
+static void confirm_top(void)
+{
+    char buf[200];
+    const Agent *m = app.agents;
+    tag(bstep == BOTS_CREATING ? "CREATING" : "NEW BOT", PAD_X, 24, true);
+    big_title(new_name, 37);
+    float y = 70;
+    if (new_desc[0]) y += text_block(new_desc, PAD_X, y, TOP_W - 2 * PAD_X, S_BODY, &BODY_COLORS, 3, NULL) + 6;
+    else {
+        text_draw("No description. " GLYPH_X " adds one.", PAD_X, y, S_SMALL, COL_TX_3);
+        y += 18;
+    }
+    rect(PAD_X, y, TOP_W - 2 * PAD_X, 1, COL_RULE);
+    y += 8;
+    snprintf(buf, sizeof buf,
+             "A new Hermes profile, copied from %s: its model, settings, API keys, SOUL, skills and memory notes. "
+             "Its chats, sessions and jobs start empty, and it shows up in Bot Mode on the PC too.",
+             agent_title(m));
+    y += text_block(buf, PAD_X, y, TOP_W - 2 * PAD_X, S_SMALL, &BODY_COLORS, 4, NULL) + 6;
+    if (bstep == BOTS_CREATING) {
+        braille(PAD_X, y + 1, 10, COL_BLUE);
+        text_draw("Setting it up on the PC...", PAD_X + 14, y, S_SMALL, COL_TX_2);
+    } else if (create_err[0]) {
+        text_block(create_err, PAD_X, y, TOP_W - 2 * PAD_X, S_SMALL, &DIM_COLORS, 3, NULL);
+    }
+    draw_header("New bot");
+    float fy = footer_begin(), fx = 7;
+    if (bstep == BOTS_CONFIRM) {
+        fx += hint(GLYPH_A, "Create", fx, fy, COL_ON);
+        fx += hint(GLYPH_X, new_desc[0] ? "Edit description" : "Add description", fx, fy, COL_ON);
+        hint(GLYPH_B, "Cancel", fx, fy, COL_ON);
+    } else {
+        hint(GLYPH_B, "Back to the list", fx, fy, COL_ON);
+    }
+}
+
+static void bots_top(void)
+{
+    if (bstep != BOTS_LIST) {
+        confirm_top();
+        return;
+    }
+    bots_clamp();
+    const Agent *a = &app.agents[bot_sel];
+    bool cur = bot_sel == app.cur;
+    char buf[200];
+    snprintf(buf, sizeof buf, "Bots · %d of %d", bot_sel + 1, app.nagents);
+    // Its picture at the right, 1:1 (the PC draws it at 36 px)
+    float right = TOP_W - PAD_X;
+    if (agent_picture(a, right - 36, 24, 36)) right -= 36 + 10;
+    float x = PAD_X + tag(a == app.agents ? "MAIN AGENT" : "BOT", PAD_X, 24, cur) + 6;
+    char idb[80];
+    snprintf(idb, sizeof idb, a != app.agents ? "@%s" : a->id[0] ? "profile %s" : "", a->id);
+    text_draw_fit(idb, x, 24.5f, S_TOOL, COL_TX_3, right - x);
+    text_draw_fit(agent_title(a), PAD_X, 37, S_BIG * 0.72f, COL_INK, right - PAD_X);
+    const char *desc = a->desc[0]                ? a->desc
+                       : a == app.agents         ? "The agent this gateway runs as. Bots are your other Hermes profiles, "
+                                                   "each with its own sessions, memory and skills."
+                                                 : "A Hermes profile with its own sessions, memory and skills.";
+    float y = 70 + text_block(desc, PAD_X, 70, TOP_W - 2 * PAD_X, S_BODY, &BODY_COLORS, 3, NULL) + 8;
+    rect(PAD_X, y, TOP_W - 2 * PAD_X, 1, COL_RULE);
+    y += 8;
+    const char *model = a->chat.model[0] ? a->chat.model : a->model;
+    kv("MODEL", model[0] ? model : "-", y, COL_INK);
+    kv("SESSION", a->chat.title[0] ? a->chat.title : a->chat.session_id[0] ? "untitled" : "none yet", y + 17, COL_INK);
+    u32 sc = COL_INK;
+    char st[64];
+    if (asks(a)) snprintf(st, sizeof st, "waiting for you"), sc = COL_BAD;
+    else if (a->chat.typing) snprintf(st, sizeof st, "working"), sc = COL_BLUE;
+    else if (a->unreachable) snprintf(st, sizeof st, "not reachable: turn on 3ds in its profile"), sc = COL_BAD;
+    else if (a->unread) snprintf(st, sizeof st, "%d new repl%s", a->unread, a->unread == 1 ? "y" : "ies");
+    else snprintf(st, sizeof st, "idle");
+    kv("STATUS", st, y + 34, sc);
+    if (a->voice_known) kv("VOICE", a->voice ? "speaks its replies" : "text replies", y + 51, COL_INK);
+    snprintf(buf, sizeof buf, "Bots · %d of %d", bot_sel + 1, app.nagents);
+    draw_header(buf);
+    top_footer(cur ? "Back to chat" : "Chat", "New bot", "Refresh");
+}
+
 // --- dispatch -----------------------------------------------------------------
 
 void tabs_input(u32 down, u32 held, const touchPosition *t)
 {
     switch (app.tab) {
+    case TAB_BOTS: bots_input(down, held, t); break;
     case TAB_SESSIONS: sessions_input(down, held, t); break;
     case TAB_SKILLS: skills_input(down, held, t); break;
     case TAB_JOBS: jobs_input(down, held, t); break;
@@ -1056,6 +1547,7 @@ void tabs_draw_top(void)
 {
     rect(0, 0, TOP_W, SCR_H, COL_PAPER);
     switch (app.tab) {
+    case TAB_BOTS: bots_top(); break;
     case TAB_SESSIONS: sessions_top(); break;
     case TAB_SKILLS: skills_top(); break;
     case TAB_JOBS: jobs_top(); break;
@@ -1068,6 +1560,7 @@ void tabs_draw_bottom(void)
 {
     rect(0, 0, BOT_W, SCR_H, COL_PAPER_2);
     switch (app.tab) {
+    case TAB_BOTS: bots_bottom(); break;
     case TAB_SESSIONS: sessions_bottom(); break;
     case TAB_SKILLS: skills_bottom(); break;
     case TAB_JOBS: jobs_bottom(); break;

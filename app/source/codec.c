@@ -105,3 +105,16 @@ void key_fingerprint(const uint8_t key[32], char out[9])
     memcpy(out, full, 8);
     out[8] = 0;
 }
+
+char *utf8_copy(char *out, size_t cap, const char *s)
+{
+    if (!cap) return out;
+    size_t n = strlen(s);
+    if (n >= cap) {
+        n = cap - 1;
+        while (n && ((unsigned char)s[n] & 0xC0) == 0x80) n--;  // s[n], the first byte left out, continues a character
+    }
+    memcpy(out, s, n);
+    out[n] = 0;
+    return out;
+}

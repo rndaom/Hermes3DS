@@ -4,6 +4,9 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "codec.h"
+#include "image.h"
+
 float S_BODY, S_SMALL, S_EYE, S_TOOL, S_TITLE, S_BIG, S_HINT;
 
 const TextColors BODY_COLORS = {
@@ -110,13 +113,20 @@ void progress_bar(float x, float y, float w, float h, float played, float loaded
 }
 
 // Letter-spaced caps for eyebrows (Rules Expanded in the mockups).
+// Bytes in the character at p (a broken sequence counts its lead byte and up to 3 more).
+static int char_len(const char *p)
+{
+    int n = 1;
+    while (n < 4 && ((unsigned char)p[n] & 0xC0) == 0x80) n++;
+    return n;
+}
+
 float spaced(const char *s, float x, float y, float scale, u32 color, float spacing)
 {
     char ch[8];
     float x0 = x;
     for (const char *p = s; *p;) {
-        int n = 1;
-        while (((unsigned char)p[n] & 0xC0) == 0x80) n++;
+        int n = char_len(p);
         memcpy(ch, p, (size_t)n);
         ch[n] = 0;
         x += text_draw(ch, x, y, scale, color) + spacing;
@@ -129,12 +139,29 @@ float spaced_width(const char *s, float scale, float spacing)
 {
     float w = 0;
     for (const char *p = s; *p;) {
-        int n = 1;
-        while (((unsigned char)p[n] & 0xC0) == 0x80) n++;
+        int n = char_len(p);
         w += text_width(p, (size_t)n, scale) + spacing;
         p += n;
     }
     return w;
+}
+
+float spaced_fit(const char *s, float x, float y, float scale, u32 color, float spacing, float max_w)
+{
+    if (spaced_width(s, scale, spacing) <= max_w) return spaced(s, x, y, scale, color, spacing);
+    char ch[8];
+    float ell = text_width("...", 3, scale), w = 0;
+    for (const char *p = s; *p;) {
+        int n = char_len(p);
+        float cw = text_width(p, (size_t)n, scale) + spacing;
+        if (w + cw + ell > max_w) break;
+        memcpy(ch, p, (size_t)n);
+        ch[n] = 0;
+        text_draw(ch, x + w, y, scale, color);
+        w += cw;
+        p += n;
+    }
+    return w + text_draw("...", x + w, y, scale, color);
 }
 
 float hint(const char *glyph, const char *label, float x, float y, u32 color)
@@ -289,9 +316,11 @@ static void draw_speaker(float x, float y, u32 color)
 void draw_header(const char *title)
 {
     rect(0, 0, TOP_W, TOP_HEADER_H, COL_BLUE);
-    hermes_mark(7, 3.5f, COL_ON);
+    char who[40];
+    if (!agent_picture(app_agent(), 5.5f, 2, 12)) agent_mark(app_agent(), 7, 3.5f, COL_ON);
+    agent_caps(app_agent(), who, sizeof who);
     float x = 19;
-    x += spaced("HERMES", x, 4.5f, S_EYE, COL_ON, 1.6f) + 5;
+    x += spaced_fit(who, x, 4.5f, S_EYE, COL_ON, 1.6f, 110) + 5;  // a long name leaves room for the model chip
     rect(x, 4.5f, 1, 7, COL_ON_3);
     x += 6;
     // right side: model chip + link state
@@ -313,11 +342,11 @@ void draw_header(const char *title)
         draw_speaker(right - vw - 12, 4.5f, COL_ON);
         right -= vw + 18;
     }
-    if (app.screen == SCR_CHAT && app.chat.model[0]) {
-        float mw = text_width(app.chat.model, strlen(app.chat.model), S_TOOL);
+    if (app.screen == SCR_CHAT && app.chat->model[0]) {
+        float mw = text_width(app.chat->model, strlen(app.chat->model), S_TOOL);
         if (mw > 110) mw = 110;
         frame_rect(right - mw - 8, 3, mw + 8, 10, COL_ON_3);
-        text_draw_fit(app.chat.model, right - mw - 4, 3.5f, S_TOOL, COL_ON, mw);
+        text_draw_fit(app.chat->model, right - mw - 4, 3.5f, S_TOOL, COL_ON, mw);
         right -= mw + 14;
     }
     text_draw_fit(title, x, 3, S_TITLE, COL_ON_2, right - x);
@@ -329,20 +358,73 @@ float footer_begin(void)
     return SCR_H - TOP_FOOTER_H + 3;
 }
 
-static const char *const TAB_NAMES[TAB_COUNT] = {"Chat", "Sessions", "Skills", "Jobs", "More"};
+static const char *const TAB_NAMES[TAB_COUNT] = {"Chat", "Bots", "Sessions", "Skills", "Jobs", "More"};
+
+// Another agent replied or waits for you: a dot on the Bots tab (yellow when it waits).
+static int bots_badge(void)
+{
+    int b = 0;
+    for (int i = 0; i < app.nagents; i++) {
+        if (i == app.cur) continue;
+        if (app.agents[i].chat.approval || app.agents[i].chat.clarify) return 2;
+        if (app.agents[i].unread) b = 1;
+    }
+    return b;
+}
 
 void draw_tabs(void)
 {
+    const float W = (float)BOT_W / TAB_COUNT;
     rect(0, 0, BOT_W, TABS_H, COL_PAPER);
     for (int i = 0; i < TAB_COUNT; i++) {
-        float x = i * 64.0f;
+        float x = floorf(i * W), w = floorf((i + 1) * W) - x;
         bool on = i == (int)app.tab;
-        if (on) rect(x, 0, 64, TABS_H, COL_BLUE);
-        else if (i < TAB_COUNT - 1 && i + 1 != (int)app.tab) rect(x + 63, 0, 1, TABS_H, COL_RULE);
-        float w = text_width(TAB_NAMES[i], strlen(TAB_NAMES[i]), S_SMALL);
-        text_draw(TAB_NAMES[i], x + (64 - w) / 2, 7, S_SMALL, on ? COL_ON : COL_INK_2);
+        if (on) rect(x, 0, w, TABS_H, COL_BLUE);
+        else if (i < TAB_COUNT - 1 && i + 1 != (int)app.tab) rect(x + w - 1, 0, 1, TABS_H, COL_RULE);
+        float tw = text_width(TAB_NAMES[i], strlen(TAB_NAMES[i]), S_SMALL);
+        if (tw > w - 6) tw = w - 6;
+        text_draw_fit(TAB_NAMES[i], x + (w - tw) / 2, 7, S_SMALL, on ? COL_ON : COL_INK_2, w - 6);
+        int badge = i == TAB_BOTS ? bots_badge() : 0;
+        if (badge) {
+            rect(x + w - 9, 4, 5, 5, badge == 2 ? COL_ACCENT : on ? COL_ON : COL_BLUE);
+            if (badge == 2) frame_rect(x + w - 9, 4, 5, 5, COL_INK);
+        }
     }
     rect(0, TABS_H - 1, BOT_W, 1, COL_INK);
+}
+
+// The caduceus for the main agent; a bot's initial in a 9 px cell.
+void agent_mark(const Agent *a, float x, float y, u32 color)
+{
+    if (a == app.agents) {
+        hermes_mark(x, y, color);
+        return;
+    }
+    char ch[2] = {agent_title(a)[0], 0};
+    if (ch[0] >= 'a' && ch[0] <= 'z') ch[0] -= 32;
+    if ((unsigned char)ch[0] >= 0x80) ch[0] = '@';  // the font draws ASCII at this size; emoji names fall back
+    float w = text_width(ch, 1, S_EYE * 1.25f);
+    text_draw(ch, x + (9 - w) / 2, y - 1.5f, S_EYE * 1.25f, color);
+}
+
+// A bot's Bot Mode picture filling a size×size box. False when it has none, while it loads, or when it can't
+// be shown: callers draw agent_mark instead.
+bool agent_picture(const Agent *a, float x, float y, float size)
+{
+    if (a == app.agents || !a->has_avatar) return false;
+    BlobState st;
+    const Picture *p = image_get(&a->avatar, &st);
+    if (!p) return false;
+    image_draw_cover(p, x, y, size, size);
+    return true;
+}
+
+// The agent's title in capitals for eyebrows ("HERMES", "RESEARCH BOT").
+void agent_caps(const Agent *a, char *out, size_t cap)
+{
+    utf8_copy(out, cap, agent_title(a));
+    for (char *p = out; *p; p++)
+        if (*p >= 'a' && *p <= 'z') *p -= 32;
 }
 
 void draw_toast(void)

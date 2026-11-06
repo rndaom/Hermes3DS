@@ -131,6 +131,15 @@ static void test_codecs(void)
     }
     CHECK(b32_decode("ABC1", b, sizeof b) == -1, "b32 must reject '1'");
     CHECK(b64u_decode("ab*c", b, sizeof b) == -1, "b64u must reject '*'");
+    // UTF-8 truncation: never half a character.
+    char u[6];
+    CHECK(!strcmp(utf8_copy(u, sizeof u, "abc"), "abc"), "utf8_copy short");
+    CHECK(!strcmp(utf8_copy(u, sizeof u, "abcdefg"), "abcde"), "utf8_copy ascii cut");
+    CHECK(!strcmp(utf8_copy(u, sizeof u, "abcd\xc3\xa9"), "abcd"), "utf8_copy 2-byte cut");
+    CHECK(!strcmp(utf8_copy(u, sizeof u, "abc\xc3\xa9"), "abc\xc3\xa9"), "utf8_copy 2-byte fits");
+    CHECK(!strcmp(utf8_copy(u, sizeof u, "ab\xf0\x9f\x98\x80"), "ab"), "utf8_copy 4-byte cut");
+    CHECK(!strcmp(utf8_copy(u, sizeof u, "a\xf0\x9f\x98\x80z"), "a\xf0\x9f\x98\x80"), "utf8_copy 4-byte fits");
+    CHECK(!strcmp(utf8_copy(u, 1, "abc"), ""), "utf8_copy cap 1");
 }
 
 int main(void)

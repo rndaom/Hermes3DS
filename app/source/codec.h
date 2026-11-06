@@ -1,4 +1,5 @@
-// Text codecs used by pairing and discovery (protocol.md §2): base64url, base32, key fingerprints.
+// Text codecs used by pairing and discovery (protocol.md §2): base64url, base32, key fingerprints. Also UTF-8
+// truncation for names the PC sends.
 #pragma once
 
 #include <stddef.h>
@@ -16,3 +17,7 @@ int b32_decode(const char *in, uint8_t *out, size_t cap);
 
 // 8 base32 chars of BLAKE2b-256(key) + NUL; the server fingerprint shown during pairing.
 void key_fingerprint(const uint8_t key[32], char out[9]);
+
+// Copies `s` into `out` (`cap` bytes with the NUL), cut short at a character boundary so a long name never ends
+// in half a character. Returns `out`.
+char *utf8_copy(char *out, size_t cap, const char *s);

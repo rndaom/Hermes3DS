@@ -34,10 +34,14 @@ void rect(float x, float y, float w, float h, u32 c);
 void disc(float cx, float cy, float r, u32 c);  // filled circle
 void frame_rect(float x, float y, float w, float h, u32 c);
 void hermes_mark(float x, float y, u32 color);  // the Hermes caduceus, 9x9 px
+void agent_mark(const Agent *a, float x, float y, u32 color);  // the caduceus, or a bot's initial
+bool agent_picture(const Agent *a, float x, float y, float size);  // a bot's picture; false while there is none
+void agent_caps(const Agent *a, char *out, size_t cap);        // its title in capitals
 void braille(float x, float y, float cell, u32 color);  // spinner cell, `cell` px tall
 void check_mark(float x, float y, float s, u32 color);
 float spaced(const char *s, float x, float y, float scale, u32 color, float spacing);  // letter-spaced caps
 float spaced_width(const char *s, float scale, float spacing);
+float spaced_fit(const char *s, float x, float y, float scale, u32 color, float spacing, float max_w);  // "..." past max_w
 float hint(const char *glyph, const char *label, float x, float y, u32 color);  // returns the advance
 void button(const Rect *r, const char *label, const char *glyph, u32 bg, u32 fg);
 

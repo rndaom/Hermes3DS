@@ -614,7 +614,8 @@ void camera_draw_top(void)
         fx += hint(GLYPH_Y, cm.caption[0] ? "Edit caption" : "Caption", fx, fy, COL_ON);
         hint(GLYPH_B, "Retake", fx, fy, COL_ON);
     }
-    const char *r = "Hermes looks at it on the PC";
+    char r[96];
+    snprintf(r, sizeof r, "%s looks at it on the PC", agent_title(app_agent()));
     float rw = text_width(r, strlen(r), S_HINT);
     text_draw(r, TOP_W - 7 - rw, fy, S_HINT, COL_ON_3);
 }
@@ -638,9 +639,12 @@ void camera_draw_bottom(void)
         rect(10, 44, BOT_W - 20, 96, COL_PAPER);
         frame_rect(10, 44, BOT_W - 20, 96, COL_RULE);
         if (cm.caption[0]) text_block(cm.caption, 16, 50, BOT_W - 32, S_SMALL, &BODY_COLORS, 5, NULL);
-        else text_draw("None. Hermes gets the photo on its own.", 16, 50, S_SMALL, COL_TX_3);
+        char line[96], send[80];
+        snprintf(line, sizeof line, "None. %s gets the photo on its own.", agent_title(app_agent()));
+        snprintf(send, sizeof send, "Send to %s", agent_title(app_agent()));
+        if (!cm.caption[0]) text_draw_fit(line, 16, 50, S_SMALL, COL_TX_3, BOT_W - 32);
         bool busy = cm.st == C_ENCODE;
-        button(&SEND, busy ? "Preparing..." : "Send to Hermes", busy ? "" : GLYPH_A, COL_BLUE, COL_ON);
+        button(&SEND, busy ? "Preparing..." : send, busy ? "" : GLYPH_A, COL_BLUE, COL_ON);
         button(&CAPTION, cm.caption[0] ? "Edit caption" : "Add a caption", GLYPH_Y, COL_PAPER, COL_INK);
         button(&RETAKE, "Retake", GLYPH_B, COL_PAPER, COL_INK);
     }

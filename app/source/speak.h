@@ -6,9 +6,11 @@
 #pragma once
 
 #include <jansson.h>
+#include <stdbool.h>
 
 void speak_arrive(const json_t *msg);  // a chat `msg` came in: queue and start its spoken parts
-void speak_part(const json_t *ev);     // a `speak` event came in: queue and start that part
+void speak_part(const json_t *ev, bool play);  // a `speak` event came in: queue and start that part (if play)
 const json_t *speak_current(void);     // the spoken part the player is on (playing or paused), or NULL
 void speak_tick(void);                 // once a frame, after audio_tick: start the next, fetch ahead
+void speak_cancel(void);               // another chat shows: stop its reply being spoken and drop the rest
 void speak_exit(void);

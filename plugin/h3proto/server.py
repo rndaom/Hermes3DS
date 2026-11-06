@@ -62,6 +62,7 @@ class _Msg:
     final: bool
     ts: float
     attach: list | None = None  # attachments (protocol.md §4.7)
+    agent: str = ""  # the bot (Hermes profile) whose chat it is; "" = the main agent (protocol.md §4.8)
     dirty: bool = False  # changed while the device was offline
     changed: float = 0.0  # time.monotonic() of the last change sent (or meant to be)
 
@@ -71,9 +72,9 @@ class _DeviceState:
     channel: Channel | None = None
     messages: "OrderedDict[str, _Msg]" = field(default_factory=OrderedDict)
     pending: "OrderedDict[str, dict]" = field(default_factory=OrderedDict)  # approvals / clarifies
-    deleted: set = field(default_factory=set)  # mids deleted while the device was offline
-    recent_deletes: "OrderedDict[str, float]" = field(default_factory=OrderedDict)  # mid -> when (monotonic)
-    typing: bool = False
+    deleted: dict = field(default_factory=dict)  # mid -> agent, deleted while the device was offline
+    recent_deletes: "OrderedDict[str, tuple[float, str]]" = field(default_factory=OrderedDict)  # mid -> (when, agent)
+    typing: set = field(default_factory=set)  # agents with a turn running ("" = the main agent)
     caps: frozenset = frozenset()  # what the app's last hello said, kept while it is offline
     # When the device last sent an authenticated frame. A connection that died without closing (lid shut, Wi-Fi
     # gone) still accepts writes until IDLE_TIMEOUT, so whatever changed after this may never have arrived.
@@ -116,6 +117,7 @@ class Hermes3DSServer:
         self.devices = devices
         self.tokens = tokens
         self.server_info = server_info or {}
+        self._slow_tasks: set[asyncio.Task] = set()  # requests answered beside their read loop (backend.slow_requests)
         self._states: dict[bytes, _DeviceState] = {}
         self._tcp: asyncio.base_events.Server | None = None
         self._away_tcp: asyncio.base_events.Server | None = None
@@ -374,18 +376,20 @@ class Hermes3DSServer:
         # Also replay what changed since the device was last heard from: it may have gone into a dead socket.
         # The app matches messages by mid, so a second copy of one that did arrive only updates it in place.
         cutoff = st.last_rx
-        deleted, st.deleted = list(st.deleted), set()
-        deleted += [mid for mid, at in st.recent_deletes.items() if at > cutoff and mid not in deleted]
-        for mid in deleted:
-            await self._send_replay(channel, {"t": "delete", "mid": mid})
+        deleted, st.deleted = dict(st.deleted), {}
+        for mid, (at, agent) in st.recent_deletes.items():
+            if at > cutoff:
+                deleted.setdefault(mid, agent)
+        for mid, agent in deleted.items():
+            await self._send_replay(channel, _tagged({"t": "delete", "mid": mid}, agent))
         for m in list(st.messages.values()):
             if m.dirty or m.changed > cutoff:
                 m.dirty = False
                 await self._send_replay(channel, self._msg_event(m))
         for prompt in list(st.pending.values()):
             await self._send_replay(channel, prompt)
-        if st.typing:
-            await channel.send({"t": "typing", "on": True})
+        for agent in sorted(st.typing):
+            await channel.send(_tagged({"t": "typing", "on": True}, agent))
         await self.backend.on_connect(device)
 
     @staticmethod
@@ -421,36 +425,54 @@ class Hermes3DSServer:
                 continue
             if t == "pong":
                 continue
-            rid = body.get("id")
-            after = None
+            if t in getattr(self.backend, "slow_requests", ()):  # e.g. agents.create: pings keep being answered
+                task = asyncio.get_running_loop().create_task(self._answer_detached(device, channel, body))
+                self._slow_tasks.add(task)
+                task.add_done_callback(self._slow_tasks.discard)
+                continue
+            await self._answer(device, channel, body)
+
+    async def _answer_detached(self, device: Device, channel: Channel, body: dict) -> None:
+        """A slow request answered beside the read loop; it runs to the end even if the connection drops."""
+        try:
+            await self._answer(device, channel, body)
+        except Exception as exc:  # the connection closed meanwhile: the 3DS asks again (or lists) when it is back
+            log.info("3ds request %r: reply not sent (%s)", body.get("t"), exc)
+
+    async def _answer(self, device: Device, channel: Channel, body: dict) -> None:
+        t = body["t"]
+        rid = body.get("id")
+        after = None
+        try:
+            if t == "blob.get":
+                reply, after = self._blob_get(channel, body)
+            elif t == "blob.put":
+                reply, after = self._blob_put(device, channel, body)
+            elif t == "blob.cancel":
+                self._cancel_transfer(channel, str(body.get("blob")))
+                return
+            else:
+                reply = await self.backend.handle(device, body)
+        except RequestError as exc:
+            reply = {"t": "error", "code": exc.code, "msg": exc.msg}
+        except Exception:
+            log.exception("3ds request %r failed", t)
+            reply = {"t": "error", "code": "internal", "msg": f"{t} failed on the PC"}
+        if reply is not None and isinstance(body.get("agent"), str) and body["agent"]:
+            reply.setdefault("agent", body["agent"])  # which bot's chat the answer is for (§4.8)
+        if reply is not None and reply.get("t") == "status_r":
+            for k, v in self._away_fields().items():
+                reply.setdefault(k, v)
+        if reply is not None and rid is not None:
+            reply.setdefault("id", rid)
             try:
-                if t == "blob.get":
-                    reply, after = self._blob_get(channel, body)
-                elif t == "blob.put":
-                    reply, after = self._blob_put(device, channel, body)
-                elif t == "blob.cancel":
-                    self._cancel_transfer(channel, str(body.get("blob")))
-                    continue
-                else:
-                    reply = await self.backend.handle(device, body)
-            except RequestError as exc:
-                reply = {"t": "error", "code": exc.code, "msg": exc.msg}
-            except Exception:
-                log.exception("3ds request %r failed", t)
-                reply = {"t": "error", "code": "internal", "msg": f"{t} failed on the PC"}
-            if reply is not None and reply.get("t") == "status_r":
-                for k, v in self._away_fields().items():
-                    reply.setdefault(k, v)
-            if reply is not None and rid is not None:
-                reply.setdefault("id", rid)
-                try:
-                    await channel.send(fit_reply(reply))
-                except ProtocolError as exc:  # still too large: answer, don't drop the connection
-                    log.warning("3ds request %r: reply not sent (%s)", t, exc)
-                    await channel.send({"t": "error", "id": rid, "code": "too_large",
-                                        "msg": f"{t}: the answer is too large to send"})
-            if after is not None:
-                after()  # blob.get: the stream starts only once its reply is on the wire
+                await channel.send(fit_reply(reply))
+            except ProtocolError as exc:  # still too large: answer, don't drop the connection
+                log.warning("3ds request %r: reply not sent (%s)", t, exc)
+                await channel.send({"t": "error", "id": rid, "code": "too_large",
+                                    "msg": f"{t}: the answer is too large to send"})
+        if after is not None:
+            after()  # blob.get: the stream starts only once its reply is on the wire
 
     # --- blobs (protocol.md §5) -----------------------------------------------------
 
@@ -592,13 +614,14 @@ class Hermes3DSServer:
             ev["spans"] = m.spans
         if m.attach:
             ev["attach"] = m.attach
-        return ev
+        return _tagged(ev, m.agent)
 
     async def post_message(self, device_key: bytes, mid: str, text: str, *, role: str = "assistant",
                            kind: str = "reply", final: bool = True, spans: list | None = None,
-                           attach: list | None = None) -> None:
+                           attach: list | None = None, agent: str = "") -> None:
         st = self._states.setdefault(device_key, _DeviceState())
-        m = _Msg(mid, role, kind, text, spans, final, time.time(), attach or None, changed=time.monotonic())
+        m = _Msg(mid, role, kind, text, spans, final, time.time(), attach or None, agent or "",
+                 changed=time.monotonic())
         st.messages[mid] = m
         while len(st.messages) > MESSAGE_HISTORY:
             st.messages.popitem(last=False)
@@ -641,35 +664,42 @@ class Hermes3DSServer:
             ev = {"t": "edit", "mid": mid, "text": text, "final": final}
             if m.spans:
                 ev["spans"] = m.spans
-        if not await self._send(st, ev):
+        if not await self._send(st, _tagged(ev, m.agent)):
             m.dirty = True
         return True
 
     async def delete_message(self, device_key: bytes, mid: str) -> bool:
         """Remove a message from the device's transcript (e.g. a streamed preview Hermes replaced)."""
         st = self._states.get(device_key)
-        if st is None or st.messages.pop(mid, None) is None:
+        m = st.messages.pop(mid, None) if st is not None else None
+        if m is None:
             return False
-        st.recent_deletes[mid] = time.monotonic()
+        st.recent_deletes[mid] = (time.monotonic(), m.agent)
         while len(st.recent_deletes) > MESSAGE_HISTORY:
             st.recent_deletes.popitem(last=False)
-        if not await self._send(st, {"t": "delete", "mid": mid}):
-            st.deleted.add(mid)
+        if not await self._send(st, _tagged({"t": "delete", "mid": mid}, m.agent)):
+            st.deleted[mid] = m.agent
         return True
 
-    def open_blank_messages(self, device_key: bytes) -> list[str]:
-        """Streamed messages still open whose text is empty (all Hermes sent was a hidden MEDIA tag)."""
+    def open_blank_messages(self, device_key: bytes, agent: str = "") -> list[str]:
+        """Streamed messages of one agent's chat still open whose text is empty (all Hermes sent was a hidden
+        MEDIA tag)."""
         st = self._states.get(device_key)
         if st is None:
             return []
-        return [m.mid for m in st.messages.values() if not m.final and not m.text.strip() and not m.attach]
+        return [m.mid for m in st.messages.values()
+                if m.agent == (agent or "") and not m.final and not m.text.strip() and not m.attach]
 
-    async def set_typing(self, device_key: bytes, on: bool) -> None:
+    async def set_typing(self, device_key: bytes, on: bool, agent: str = "") -> None:
         st = self._states.setdefault(device_key, _DeviceState())
-        if st.typing == on:
+        agent = agent or ""
+        if (agent in st.typing) == on:
             return
-        st.typing = on
-        await self._send(st, {"t": "typing", "on": on})
+        if on:
+            st.typing.add(agent)
+        else:
+            st.typing.discard(agent)
+        await self._send(st, _tagged({"t": "typing", "on": on}, agent))
 
     async def event(self, device_key: bytes, msg: dict) -> None:
         """Transient event (e.g. `tool`); dropped when the device is offline."""
@@ -683,13 +713,33 @@ class Hermes3DSServer:
         await self._send(st, prompt)
 
     async def clear_pending(self, device_key: bytes, key: str, done: dict | None) -> None:
+        """Drop a pending prompt; `done` (tagged with the prompt's agent) tells the app it is settled."""
         st = self._states.get(device_key)
-        if st and st.pending.pop(key, None) is not None and done is not None:
-            await self._send(st, done)
+        prompt = st.pending.pop(key, None) if st else None
+        if prompt is not None and done is not None:
+            await self._send(st, _tagged(dict(done), str(prompt.get("agent") or "")))
+
+    async def clear_agent_pending(self, agent: str) -> None:
+        """A bot left the gateway: settle its prompts on every device (they can never be answered now)."""
+        for st in self._states.values():
+            for key, prompt in list(st.pending.items()):
+                if str(prompt.get("agent") or "") != agent:
+                    continue
+                del st.pending[key]
+                done = ({"t": "approval_done", "req": prompt.get("req"), "choice": "timeout"}
+                        if prompt.get("t") == "approval" else {"t": "clarify_done", "cid": prompt.get("cid")})
+                await self._send(st, _tagged(done, agent))
 
     def pending(self, device_key: bytes, key: str) -> dict | None:
         st = self._states.get(device_key)
         return st.pending.get(key) if st else None
+
+
+def _tagged(ev: dict, agent: str) -> dict:
+    """`ev` marked with the bot whose chat it belongs to; the main agent's events carry no tag (§4.8)."""
+    if agent:
+        ev["agent"] = agent
+    return ev
 
 
 class _Discovery(asyncio.DatagramProtocol):

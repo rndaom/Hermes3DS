@@ -96,7 +96,7 @@ void speak_arrive(const json_t *msg)
     service();
 }
 
-void speak_part(const json_t *ev)
+void speak_part(const json_t *ev, bool play)
 {
     // Remembered even when it isn't played (Spoken replies off, the mic or camera busy): a whole-reply voice
     // message with this id (servers before 0.1.0 posted one) is then left for the user to play, not spoken late.
@@ -105,7 +105,7 @@ void speak_part(const json_t *ev)
         snprintf(spoken[spoken_next], sizeof spoken[0], "%s", sid);
         spoken_next = (spoken_next + 1) % SPOKEN;
     }
-    if (!wanted()) return;
+    if (!play || !wanted()) return;  // (another bot's chat: only remembered)
     init();
     json_t *a = json_object_get(ev, "attach");
     if (!json_is_true(json_object_get(a, "voice")) || !audio_playable(a)) return;
@@ -128,6 +128,15 @@ void speak_tick(void)
         return;
     }
     service();
+}
+
+void speak_cancel(void)
+{
+    if (!ready) return;
+    AudioStatus st;
+    const json_t *cur = autoplay_current(&ap);
+    if (cur && audio_status(cur, &st) && st.playing) audio_pause();  // (a track the user started plays on)
+    autoplay_cancel(&ap);
 }
 
 void speak_exit(void)

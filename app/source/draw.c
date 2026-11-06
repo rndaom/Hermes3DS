@@ -39,7 +39,7 @@ static bool is_agent(const Msg *m) { return m && (m->role == R_ASSISTANT || m->r
 
 static void block_of(int i, Block *b)
 {
-    const Msg *m = app.chat.m[i], *prev = i > 0 ? app.chat.m[i - 1] : NULL;
+    const Msg *m = app.chat->m[i], *prev = i > 0 ? app.chat->m[i - 1] : NULL;
     memset(b, 0, sizeof *b);
     b->gap = (m->role == R_TOOL && prev && prev->role == R_TOOL) ? 1 : (prev ? 8 : 0);
     switch (m->role) {
@@ -237,7 +237,7 @@ static void draw_caret(const Msg *m, float x, float y, float base)
 
 static void draw_message(int i, const Block *b, float y, float top, float bottom)
 {
-    const Msg *m = app.chat.m[i];
+    const Msg *m = app.chat->m[i];
     char tbuf[24], eyebrow[48];
     clock_text(m->local_time, tbuf, sizeof tbuf);
     switch (m->role) {
@@ -267,9 +267,14 @@ static void draw_message(int i, const Block *b, float y, float top, float bottom
     case R_TOOL: {
         float ty = y;
         if (b->head) {
-            frame_rect(PAD_X, y, 15, 15, COL_LINE_B);
-            hermes_mark(PAD_X + 3, y + 3, COL_BLUE);
-            float w = spaced("HERMES", TEXT_X, y + 4, S_EYE, COL_BLUE, 1.6f);
+            char who[40];
+            if (!agent_picture(app_agent(), PAD_X, y, 15)) {
+                frame_rect(PAD_X, y, 15, 15, COL_LINE_B);
+                agent_mark(app_agent(), PAD_X + 3, y + 3, COL_BLUE);
+            }
+            agent_caps(app_agent(), who, sizeof who);
+            float tw = tbuf[0] ? text_width(tbuf, strlen(tbuf), S_EYE * 1.1f) + 5 : 0;  // the time after it
+            float w = spaced_fit(who, TEXT_X, y + 4, S_EYE, COL_BLUE, 1.6f, TOP_W - PAD_X - TEXT_X - tw);
             if (tbuf[0]) text_draw(tbuf, TEXT_X + w + 5, y + 3.5f, S_EYE * 1.1f, COL_TX_3);
             ty += b->head_h;
         }
@@ -318,9 +323,9 @@ static void draw_status_line(float y)
     rect(0, y, TOP_W, TOP_STATUS_H, COL_SCR);
     rect(0, y, TOP_W, 1, COL_RULE);
     char buf[160];
-    if (app.chat.typing) {
+    if (app.chat->typing) {
         braille(PAD_X, y + 3, 10, COL_BLUE);
-        u64 el = (osGetTime() - app.chat.typing_since) / 1000;
+        u64 el = (osGetTime() - app.chat->typing_since) / 1000;
         const char *verb = VERBS[(el / 3) % (sizeof VERBS / sizeof VERBS[0])];
         snprintf(buf, sizeof buf, "%s...", verb);
         float w = text_draw(buf, PAD_X + 13, y + 3, S_SMALL, COL_TX_2);
@@ -355,18 +360,18 @@ static void draw_footer(void)
         if (app.have_server && app.pstep != PAIR_CONFIRM) hint(GLYPH_B, "Back to chat", x, y, COL_ON);
         return;
     }
-    if (app.chat.approval) {
+    if (app.chat->approval) {
         x += hint(GLYPH_A, "Allow once", x, y, COL_ON);
         x += hint(GLYPH_B, "Deny", x, y, COL_ON);
-    } else if (app.chat.clarify && !clar_count()) {
+    } else if (app.chat->clarify && !clar_count()) {
         x += hint(GLYPH_A, "Answer", x, y, COL_ON);
-    } else if (app.chat.clarify) {
+    } else if (app.chat->clarify) {
         x += hint(GLYPH_A, clar_multi() ? "Tick" : "Pick", x, y, COL_ON);
         if (clar_multi()) x += hint(GLYPH_X, "Send", x, y, COL_ON);
         x += hint(GLYPH_Y, "Type", x, y, COL_ON);
     } else {
         x += hint(GLYPH_A, "Write", x, y, COL_ON);
-        if (app.chat.typing) x += hint(GLYPH_B, "Stop", x, y, COL_ON);
+        if (app.chat->typing) x += hint(GLYPH_B, "Stop", x, y, COL_ON);
         if (files_count()) x += hint(GLYPH_X, "Files", x, y, COL_ON);
         const json_t *au = app_chat_audio();
         AudioStatus s;
@@ -374,7 +379,7 @@ static void draw_footer(void)
                           COL_ON);
         else x += hint(GLYPH_Y, "Hold to talk", x, y, COL_ON);
     }
-    if (app.chat.approval || app.chat.clarify) {
+    if (app.chat->approval || app.chat->clarify) {
         const char *r = "Light stays on until you answer";
         float w = text_width(r, strlen(r), S_HINT);
         text_draw(r, TOP_W - 7 - w, y, S_HINT, COL_ON);
@@ -390,7 +395,7 @@ static void draw_footer(void)
 // "m:ss" since the pending approval / clarify arrived.
 static void waiting_text(char *out, size_t cap)
 {
-    u64 s = (osGetTime() - app.chat.prompt_since) / 1000;
+    u64 s = (osGetTime() - app.chat->prompt_since) / 1000;
     snprintf(out, cap, "waiting %llu:%02llu", (unsigned long long)(s / 60), (unsigned long long)(s % 60));
 }
 
@@ -401,11 +406,11 @@ static void waiting_text(char *out, size_t cap)
 // Pinned above the footer while Hermes waits; the transcript scrolls above it.
 static void draw_approval_card(float y)
 {
-    json_t *a = app.chat.approval;
+    json_t *a = app.chat->approval;
     const char *cmd = json_string_value(json_object_get(a, "command"));
     const char *desc = json_string_value(json_object_get(a, "description"));
     float x = 8, w = TOP_W - 16, h = APPR_CARD_H;
-    char buf[64];
+    char buf[96];  // (a 63-byte name and the rest)
     rect(x + 3, y + 3, w, h, COL_BLUE);
     rect(x, y, w, h, COL_PAPER);
     // Yellow band: label, a run of slashes, and the wait time.
@@ -416,7 +421,8 @@ static void draw_approval_card(float y)
     text_draw(buf, x + w - 6 - ww, y + 2, S_TOOL, COL_INK);
     for (float sx = lx; sx < x + w - 14 - ww; sx += 5) text_draw("/", sx, y + 1.5f, S_TOOL, COL_INK_2);
     frame_rect(x, y, w, h, COL_INK);
-    text_draw("Hermes wants to run a command", x + 8, y + 19, S_BIG * 0.55f, COL_INK);
+    snprintf(buf, sizeof buf, "%s wants to run a command", agent_title(app_agent()));
+    text_draw_fit(buf, x + 8, y + 19, S_BIG * 0.55f, COL_INK, w - 16);
     // The command on blue, as a terminal line.
     float by = y + 42;
     rect(x + 8, by, w - 16, 34, COL_BLUE);
@@ -432,8 +438,8 @@ static void draw_approval_card(float y)
 
 static void draw_chat_top(void)
 {
-    bool card = app.chat.approval != NULL;
-    bool status = !card && (app.chat.typing || app.net != NET_ONLINE);
+    bool card = app.chat->approval != NULL;
+    bool status = !card && (app.chat->typing || app.net != NET_ONLINE);
     float top = TOP_HEADER_H, bottom = SCR_H - TOP_FOOTER_H - (status ? TOP_STATUS_H : 0);
     if (card) bottom = SCR_H - TOP_FOOTER_H - APPR_CARD_H - 8;
     app.view_h = bottom - top - 8;
@@ -441,9 +447,9 @@ static void draw_chat_top(void)
     // Layout pass: positions are cheap to recompute; wrapping is cached per message.
     static Block blocks[CHAT_MAX];
     float total = 0;
-    for (int i = 0; i < app.chat.n; i++) {
+    for (int i = 0; i < app.chat->n; i++) {
         block_of(i, &blocks[i]);
-        Msg *m = app.chat.m[i];
+        Msg *m = app.chat->m[i];
         relayout(m, &blocks[i]);
         if (m->role == R_ASSISTANT || m->role == R_SYSTEM)
             m->h = (m->len || !m->attach ? visible_height(m) : 0) + (m->attach ? attach_height(m) : 0);
@@ -458,14 +464,17 @@ static void draw_chat_top(void)
     if (app.scroll > max) app.scroll = max > 0 ? max : 0;
 
     float y = top + 8 - (total > app.view_h ? total - app.view_h - app.scroll : 0);
-    for (int i = 0; i < app.chat.n; i++) {
+    for (int i = 0; i < app.chat->n; i++) {
         const Block *b = &blocks[i];
-        float h = b->gap + b->head_h + app.chat.m[i]->h;  // as measured in the layout pass
+        float h = b->gap + b->head_h + app.chat->m[i]->h;  // as measured in the layout pass
         if (y + h >= top && y <= bottom) draw_message(i, b, y + b->gap, top, bottom);
         y += h;
     }
-    if (app.chat.n == 0) {
-        text_draw("Say hello. Press " GLYPH_A " to write.", TEXT_X, top + 12, S_BODY, COL_TX_3);
+    if (app.chat->n == 0) {
+        char hello[96];
+        if (app.cur) snprintf(hello, sizeof hello, "Say hello to %s. Press " GLYPH_A " to write.", agent_title(app_agent()));
+        else snprintf(hello, sizeof hello, "Say hello. Press " GLYPH_A " to write.");
+        text_draw_fit(hello, TEXT_X, top + 12, S_BODY, COL_TX_3, TOP_W - TEXT_X - PAD_X);
     }
 
     // Scroll indicator when not at the bottom.
@@ -478,7 +487,8 @@ static void draw_chat_top(void)
 
     char title[128];
     snprintf(title, sizeof title, "%s",
-             app.chat.title[0] ? app.chat.title : app.server.name[0] ? app.server.name : "Hermes");
+             app.chat->title[0] ? app.chat->title
+             : app.cur || !app.server.name[0] ? agent_title(app_agent()) : app.server.name);
     if (card) {
         rect(0, bottom, TOP_W, SCR_H - bottom, COL_PAPER);
         draw_approval_card(bottom + 2);
@@ -495,7 +505,7 @@ const char *const APPR_CHOICE[APPR_N] = {"once", "session", "always", "deny"};
 // Which choices the request offers (all four when it doesn't say).
 static bool appr_offered(int i)
 {
-    json_t *acts = json_object_get(app.chat.approval, "actions");
+    json_t *acts = json_object_get(app.chat->approval, "actions");
     if (!json_array_size(acts)) return true;
     for (size_t k = 0; k < json_array_size(acts); k++)
         if (!strcmp(json_string_value(json_array_get(json_array_get(acts, k), 1)) ?: "", APPR_CHOICE[i])) return true;
@@ -505,22 +515,22 @@ static bool appr_offered(int i)
 // The pending clarify's question, choice count, choice i and whether several may be picked.
 static const char *clar_question(void)
 {
-    return json_string_value(json_object_get(app.chat.clarify, "question")) ?: "";
+    return json_string_value(json_object_get(app.chat->clarify, "question")) ?: "";
 }
 
 int clar_count(void)
 {
-    return (int)json_array_size(json_object_get(app.chat.clarify, "choices"));
+    return (int)json_array_size(json_object_get(app.chat->clarify, "choices"));
 }
 
 const char *clar_choice(int i)
 {
-    return json_string_value(json_array_get(json_object_get(app.chat.clarify, "choices"), (size_t)i)) ?: "";
+    return json_string_value(json_array_get(json_object_get(app.chat->clarify, "choices"), (size_t)i)) ?: "";
 }
 
 bool clar_multi(void)
 {
-    return json_is_true(json_object_get(app.chat.clarify, "multi")) && clar_count() > 0;
+    return json_is_true(json_object_get(app.chat->clarify, "multi")) && clar_count() > 0;
 }
 
 #define CLAR_Q_Y 45
@@ -541,7 +551,7 @@ static void clarify_layout(BottomLayout *l)
     int rows = n < fit ? n : fit;
     if (rows > CLAR_ROWS) rows = CLAR_ROWS;
     if (rows < 1) rows = 1;
-    int first = app.chat.clar_cur - rows + 1;
+    int first = app.chat->clar_cur - rows + 1;
     if (first > n - rows) first = n - rows;
     if (first < 0) first = 0;
     l->clar_rows = rows;
@@ -559,8 +569,9 @@ static void clarify_layout(BottomLayout *l)
 void bottom_layout(BottomLayout *l)
 {
     memset(l, 0, sizeof *l);
-    for (int i = 0; i < 5; i++) l->tabs[i] = (Rect){i * 64.0f, 0, 64, TABS_H};
-    if (app.chat.approval) {
+    const float tw = (float)BOT_W / TAB_COUNT;
+    for (int i = 0; i < TAB_COUNT; i++) l->tabs[i] = (Rect){i * tw, 0, tw, TABS_H};
+    if (app.chat->approval) {
         const Rect full[APPR_N] = {
             {8, 76, BOT_W - 16, 40}, {8, 122, (BOT_W - 22) / 2.0f, 40},
             {8 + (BOT_W - 22) / 2.0f + 6, 122, (BOT_W - 22) / 2.0f, 40}, {8, 168, BOT_W - 16, 36}};
@@ -571,12 +582,12 @@ void bottom_layout(BottomLayout *l)
             int i = appr_offered(APPR_SESSION) ? APPR_SESSION : APPR_ALWAYS;
             if (appr_offered(i)) l->appr[i] = (Rect){8, 122, BOT_W - 16, 40};
         }
-    } else if (app.chat.clarify) {
+    } else if (app.chat->clarify) {
         clarify_layout(l);
     }
     float y = TABS_H + 7;
     // (A pending approval or clarify replaces this whole screen with its own panel.)
-    l->strip_kind = app.net == NET_REFUSED ? STRIP_REFUSED : app.chat.typing ? STRIP_WORKING : STRIP_NONE;
+    l->strip_kind = app.net == NET_REFUSED ? STRIP_REFUSED : app.chat->typing ? STRIP_WORKING : STRIP_NONE;
     if (l->strip_kind != STRIP_NONE) {
         l->strip = (Rect){8, y, BOT_W - 16, 34};
         l->strip_btn = (Rect){BOT_W - 8 - 6 - 58, y + 6, 58, 22};
@@ -602,7 +613,7 @@ static void draw_approval_bottom(const BottomLayout *l)
 {
     static const char *const TITLE[APPR_N] = {"Allow once", "This session", "Always", "Deny"};
     static const char *const SUB[APPR_N] = {"Just this command, right now", "Until you start a new one",
-                                            "For commands like this", "Hermes will find another way"};
+                                            "For commands like this", NULL};
     char buf[48];
     spaced("APPROVE", 12, 34, S_EYE, COL_TX_3, 1.6f);
     waiting_text(buf, sizeof buf);
@@ -619,7 +630,11 @@ static void draw_approval_bottom(const BottomLayout *l)
         frame_rect(r->x, r->y, r->w, r->h, primary ? COL_BLUE : deny ? COL_BAD : COL_RULE);
         float ty = r->y + (r->h - 26) / 2;
         text_draw_fit(TITLE[i], r->x + 10, ty, S_BODY, fg, r->w - 34);
-        text_draw_fit(SUB[i], r->x + 10, ty + 15, S_TOOL, fg2, r->w - 34);
+        char deny_sub[80], who[41];
+        if (!SUB[i])
+            snprintf(deny_sub, sizeof deny_sub, "%s will find another way",
+                     utf8_copy(who, sizeof who, agent_title(app_agent())));
+        text_draw_fit(SUB[i] ? SUB[i] : deny_sub, r->x + 10, ty + 15, S_TOOL, fg2, r->w - 34);
         const char *glyph = primary ? GLYPH_A : deny ? GLYPH_B : ">";
         text_draw(glyph, r->x + r->w - 18, r->y + (r->h - 14) / 2, S_HINT * 1.2f, fg);
     }
@@ -633,7 +648,7 @@ static void draw_clarify_bottom(const BottomLayout *l)
     char buf[48];
     float ex = spaced(!n ? "QUESTION" : multi ? "PICK ANY" : "PICK ONE", 12, 34, S_EYE, COL_TX_3, 1.6f);
     if (n > l->clar_rows) {
-        snprintf(buf, sizeof buf, "%d of %d", app.chat.clar_cur + 1, n);
+        snprintf(buf, sizeof buf, "%d of %d", app.chat->clar_cur + 1, n);
         text_draw(buf, 12 + ex + 6, 33, S_TOOL, COL_TX_3);
     }
     waiting_text(buf, sizeof buf);
@@ -646,7 +661,7 @@ static void draw_clarify_bottom(const BottomLayout *l)
     for (int r = 0; r < l->clar_rows; r++) {
         const Rect *b = &l->clar[r];
         int i = l->clar_first + r;
-        bool cur = i == app.chat.clar_cur, on = multi && (app.chat.clar_sel >> i & 1);
+        bool cur = i == app.chat->clar_cur, on = multi && (app.chat->clar_sel >> i & 1);
         u32 fg = cur ? COL_ON : COL_INK;
         rect(b->x, b->y, b->w, b->h, cur ? COL_BLUE : COL_PAPER);
         frame_rect(b->x, b->y, b->w, b->h, cur ? COL_BLUE : COL_RULE);
@@ -668,7 +683,7 @@ static void draw_clarify_bottom(const BottomLayout *l)
     button(&l->clar_type, multi ? "Type instead" : "Type an answer", GLYPH_Y, COL_PAPER, COL_INK);
     if (multi) {
         int k = 0;
-        for (int i = 0; i < n && i < 32; i++) k += app.chat.clar_sel >> i & 1;
+        for (int i = 0; i < n && i < 32; i++) k += app.chat->clar_sel >> i & 1;
         snprintf(buf, sizeof buf, k ? "Send %d" : "Send", k);
         button(&l->clar_send, buf, GLYPH_X, k ? COL_BLUE : COL_PAPER_2, k ? COL_ON : COL_TX_3);
     }
@@ -680,11 +695,11 @@ static void draw_chat_bottom(void)
     bottom_layout(&l);
     rect(0, 0, BOT_W, SCR_H, COL_PAPER_2);
     draw_tabs();
-    if (app.chat.approval) {
+    if (app.chat->approval) {
         draw_approval_bottom(&l);
         return;
     }
-    if (app.chat.clarify) {
+    if (app.chat->clarify) {
         draw_clarify_bottom(&l);
         return;
     }
@@ -695,11 +710,12 @@ static void draw_chat_bottom(void)
     case STRIP_WORKING: {
         rect(s->x, s->y, s->w, s->h, COL_BLUE);
         braille(s->x + 9, s->y + 12, 11, COL_ON);
-        text_draw("Hermes is working", s->x + 24, s->y + 5, S_BODY * 0.95f, COL_ON);
-        u64 el = (osGetTime() - app.chat.typing_since) / 1000;
+        snprintf(buf, sizeof buf, "%s is working", agent_title(app_agent()));
+        text_draw_fit(buf, s->x + 24, s->y + 5, S_BODY * 0.95f, COL_ON, 150);
+        u64 el = (osGetTime() - app.chat->typing_since) / 1000;
         int tools = 0;
-        for (int i = app.chat.n - 1; i >= 0 && i >= app.chat.n - 30; i--)
-            if (app.chat.m[i]->role == R_TOOL && app.chat.m[i]->running) tools++;
+        for (int i = app.chat->n - 1; i >= 0 && i >= app.chat->n - 30; i--)
+            if (app.chat->m[i]->role == R_TOOL && app.chat->m[i]->running) tools++;
         snprintf(buf, sizeof buf, "%llus%s", (unsigned long long)el, tools ? " · running a tool" : "");
         text_draw(buf, s->x + 24, s->y + 20, S_TOOL, COL_ON_2);
         button(&l.strip_btn, "Stop", GLYPH_B, COL_PAPER, COL_BLUE);
@@ -727,12 +743,15 @@ static void draw_chat_bottom(void)
     for (int r = 0; r < 3; r++)
         for (int k = 0; k < 4 - (r == 2 ? 2 : 0); k++)
             rect(in->x + 9 + k * 3 + (r == 2 ? 3 : 0), in->y + 11 + r * 3, 2, 2, COL_BLUE);
-    const char *ph = app.draft[0] ? app.draft : "Write to Hermes...";
-    float pw = text_draw_fit(ph, in->x + 26, in->y + 5, S_BODY * 0.95f, app.draft[0] ? COL_INK : COL_INK_3,
+    char wr[96];
+    snprintf(wr, sizeof wr, "Write to %s...", agent_title(app_agent()));
+    const char *draft = app_agent()->draft;
+    const char *ph = draft[0] ? draft : wr;
+    float pw = text_draw_fit(ph, in->x + 26, in->y + 5, S_BODY * 0.95f, draft[0] ? COL_INK : COL_INK_3,
                              in->w - 26 - 24);
     if ((osGetTime() / 530) % 2 == 0 || !app_animating())
         rect(in->x + 27 + pw, in->y + 6, 3, 10, COL_BLUE);
-    text_draw(app.chat.typing ? "Queues until this step ends" : "Tap here or press " GLYPH_A, in->x + 26,
+    text_draw(app.chat->typing ? "Queues until this step ends" : "Tap here or press " GLYPH_A, in->x + 26,
               in->y + 19, S_TOOL, COL_INK_3);
 
     // Quick tiles: hold to talk, take a photo.
@@ -756,7 +775,8 @@ static void draw_chat_bottom(void)
     disc(cx, cy + 0.5f, 4.5f, COL_PAPER);
     disc(cx, cy + 0.5f, 2.5f, COL_BLUE);
     text_draw("Photo", pt->x + 30, pt->y + 5, S_BODY, COL_INK);
-    text_draw("For Hermes to look at", pt->x + 30, pt->y + 21, S_TOOL * 0.92f, COL_TX_3);
+    snprintf(wr, sizeof wr, "For %s to look at", agent_title(app_agent()));
+    text_draw_fit(wr, pt->x + 30, pt->y + 21, S_TOOL * 0.92f, COL_TX_3, pt->w - 34);
 
     // Connection panel.
     const Rect *p = &l.panel;

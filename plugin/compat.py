@@ -1,8 +1,9 @@
 """Every read of Hermes' state lives here (protocol.md §4.6), so upstream churn breaks one file.
 
 Only public Hermes surfaces are used (the plugin catalog's rule 9): `hermes_state.SessionDB`, the runner's
-session store, `hermes_cli.config`, `tools.skills_tool`, `tools.registry` and the `cronjob_manage` tool through
-the plugin context. Where Hermes has no public API yet (its command catalog, the model picker's provider
+session store and served-profile list, `hermes_cli.config`, `tools.skills_tool`, `tools.registry`, the
+`cronjob_manage` tool through the plugin context, and `hermes_constants` / `agent.secret_scope` to read another
+profile's state (a bot's) under that profile's home and secrets, as Hermes' own multiplexed gateway does. Where Hermes has no public API yet (its command catalog, the model picker's provider
 inventory, toolset labels) the 3DS gets a simpler view built from those.
 
 Each function runs blocking Hermes code via asyncio.to_thread where needed and returns plain JSON-able
@@ -16,17 +17,24 @@ import contextlib
 import functools
 import json
 import logging
+import os
+import re
+import shutil
+import subprocess
+import sys
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
+from .h3proto import avatar
 from .h3proto.emoji import emoji_for_3ds
 from .h3proto.server import RequestError
 
 log = logging.getLogger("hermes3ds")
 
 _ctx: Any = None  # the PluginContext register() got; tools are dispatched through it
-_db: Any = None
+_dbs: dict[str, Any] = {}  # read-only session databases: "" = the main agent's, else a bot's state.db path
 _db_lock = threading.Lock()
 
 
@@ -49,13 +57,17 @@ def _guard(fn):
 
 
 def _session_db():
-    """Hermes' session database, opened read-only once (the gateway keeps its own writer)."""
-    global _db
+    """The session database of the profile in scope (the main agent's, or a bot's inside `profile_scope`),
+    opened read-only once (the gateway keeps its own writer)."""
+    from hermes_constants import get_hermes_home_override
+    override = get_hermes_home_override()
+    key = str(Path(override) / "state.db") if override else ""
     with _db_lock:
-        if _db is None:
+        db = _dbs.get(key)
+        if db is None:
             from hermes_state import SessionDB
-            _db = SessionDB(read_only=True)
-        return _db
+            db = _dbs[key] = SessionDB(db_path=Path(key), read_only=True) if key else SessionDB(read_only=True)
+        return db
 
 
 def _config() -> dict[str, Any]:
@@ -82,6 +94,171 @@ def _ts(value: Any) -> float | None:
 def _clip(text: Any, n: int) -> str:
     s = "" if text is None else emoji_for_3ds(str(text))
     return s if len(s) <= n else s[: n - 1] + "…"
+
+
+# --- agents: Hermes profiles, which Bot Mode shows as bots (protocol.md §4.8) -----------------------------
+
+PROFILE_ID = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")  # hermes_constants.PROFILE_ID_RE
+DESC_MAX = 400
+CREATE_TIMEOUT = 180.0  # seconds for `hermes profile create` (it copies the skill tree)
+RESERVED_NAMES = frozenset({"hermes", "default", "main", "test", "tmp", "root", "sudo"})  # + hermes_cli.profiles'
+RETRY_WINDOW = 600.0    # a create asked again this soon after it succeeded gets the same bot back
+_creating: set[str] = set()
+_created: dict[str, float] = {}  # profile -> when this gateway made it (time.monotonic)
+
+
+def multiplexed(runner) -> bool:
+    """Whether this gateway serves several profiles (`gateway.multiplex_profiles`, Hermes' default). Without it
+    the gateway runs one profile, and a bot can only be reached through its own gateway."""
+    return bool(getattr(getattr(runner, "config", None), "multiplex_profiles", False))
+
+
+def served_agents(runner) -> list[str]:
+    """Profiles this gateway runs turns for, the main one first (`GatewayRunner.served_profile_names`)."""
+    names: list[str] = []
+    with contextlib.suppress(Exception):
+        names = [str(n) for n in runner.served_profile_names() if n]
+    names = names or ["default"]
+    return names if multiplexed(runner) else names[:1]
+
+
+def agent_home(runner, name: str) -> Path:
+    """A served profile's Hermes home: the gateway's own for the main agent, else `<root>/profiles/<name>`."""
+    from hermes_constants import get_process_hermes_home
+    root = Path(get_process_hermes_home())
+    return root if name == served_agents(runner)[0] else root / "profiles" / name
+
+
+@contextlib.asynccontextmanager
+async def profile_scope(home: Path | None):
+    """Read a bot's state as that bot: its home (config, sessions, skills, cron) and its own secrets, through the
+    same context-local overrides Hermes' multiplexer puts around a routed turn. `None`: the main agent, as is.
+    Context variables, so `asyncio.to_thread` work started inside follows them. The secrets stay in Hermes' scope:
+    the plugin never reads them itself; Hermes calls made inside (models, skills, cron) resolve that profile's
+    settings instead of the main profile's."""
+    if home is None:
+        yield
+        return
+    from agent.secret_scope import build_profile_secret_scope, reset_secret_scope, set_secret_scope
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    secrets = await asyncio.to_thread(build_profile_secret_scope, home)  # reads files: not on the event loop
+    home_token = set_hermes_home_override(str(home))
+    secret_token = set_secret_scope(secrets, profile_home=str(home))
+    try:
+        yield
+    finally:
+        reset_secret_scope(secret_token)
+        reset_hermes_home_override(home_token)
+
+
+def _yaml(path: Path) -> dict:
+    try:
+        import yaml
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _pretty(name: str) -> str:
+    """`research-buddy` → `Research Buddy`, for a profile nobody gave a title."""
+    return " ".join(w[:1].upper() + w[1:] for w in re.split(r"[-_]+", name) if w) or name
+
+
+def _agent_info(name: str, home: Path, primary: bool) -> dict[str, Any]:
+    """What the roster shows: the Bot Mode title (`profile.yaml` ui_meta), else the display name, else the id;
+    the role description; the configured model. `_look` is what its picture is drawn from (`avatar.look`), for
+    the adapter to turn into a blob; it never goes on the wire. Blocking (reads two YAML files)."""
+    meta = _yaml(home / "profile.yaml")
+    bots = (meta.get("ui_meta") or {}).get("hermes-bots") if isinstance(meta.get("ui_meta"), dict) else None
+    title = str((bots or {}).get("title") or "").strip() if isinstance(bots, dict) else ""
+    title = title or str(meta.get("display_name") or "").strip() or ("Hermes" if primary else _pretty(name))
+    cfg = _yaml(home / "config.yaml")
+    model, provider = _current_model(cfg)
+    return {"id": name, "title": _clip(title, 48), "desc": _clip(str(meta.get("description") or "").strip(), DESC_MAX),
+            "model": _clip(model, 60), "provider": provider, "primary": primary, "bot": isinstance(bots, dict),
+            "_look": None if primary else avatar.look(name, home, bots if isinstance(bots, dict) else None)}
+
+
+@_guard
+async def agents_list(runner) -> dict[str, Any]:
+    names = served_agents(runner)
+
+    def build():
+        return [_agent_info(n, agent_home(runner, n), i == 0) for i, n in enumerate(names)]
+
+    return {"items": await asyncio.to_thread(build), "multiplex": multiplexed(runner)}
+
+
+def _hermes_cli() -> str | None:
+    """The `hermes` entrypoint of this Hermes install (beside its Python), else the one on PATH."""
+    exe = Path(sys.executable).with_name("hermes.exe" if os.name == "nt" else "hermes")
+    return str(exe) if exe.is_file() else shutil.which("hermes")
+
+
+def slug(text: str) -> str:
+    """A profile id from what was typed: `Research Buddy!` → `research-buddy`."""
+    s = re.sub(r"[^a-z0-9_-]+", "-", text.strip().lower()).strip("-_")
+    return re.sub(r"-{2,}", "-", s)[:64].rstrip("-_")
+
+
+@_guard
+async def agents_create(runner, name: str, desc: str) -> dict[str, Any]:
+    """A new bot: `hermes profile create <name> --clone-from <main> --no-alias [--description …]`, the CLI twin of
+    Bot Mode's New Agent with "Copy API keys" on (config, keys, SOUL, skills, plugins and memory notes come along;
+    chats, cron jobs and messaging channels do not). A clone has no `platforms:` section, so the 3ds platform is
+    switched back on in it (`hermes -p <name> config set platforms.3ds.enabled true`): without it the bot's copy of
+    this plugin never starts and the 3DS can't reach it. Then the gateway is asked to serve it at once."""
+    if not multiplexed(runner):
+        raise RequestError("unavailable", "this gateway serves one profile (gateway.multiplex_profiles is off)")
+    if not PROFILE_ID.match(name):
+        raise RequestError("bad_request", "a bot name uses a-z, 0-9, - and _")
+    if name in RESERVED_NAMES:
+        raise RequestError("bad_request", f"{name} is reserved by Hermes: pick another name")
+    names = served_agents(runner)
+    made = _created.get(name)
+    if made is not None and time.monotonic() - made < RETRY_WINDOW:  # the 3DS lost the reply and asks again
+        return await asyncio.to_thread(_agent_info, name, agent_home(runner, name), False)
+    if name in names or agent_home(runner, name).exists():
+        raise RequestError("bad_request", f"there is already a profile called {name}")
+    if name in _creating:
+        raise RequestError("bad_request", f"{name} is already being made")
+    cli = _hermes_cli()
+    if cli is None:
+        raise RequestError("unavailable", "the hermes command was not found on the PC")
+    args = [cli, "profile", "create", name, "--clone-from", names[0], "--no-alias"]
+    if desc:
+        args.append("--description=" + desc[:DESC_MAX])  # one argument even when it starts with "-"
+
+    def run(argv):
+        return subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=CREATE_TIMEOUT)
+
+    def last_line(out, what):
+        lines = [ln.strip() for ln in (out.stderr or out.stdout or "").splitlines() if ln.strip()]
+        return _clip(lines[-1] if lines else f"{what} failed ({out.returncode})", 200)
+
+    _creating.add(name)
+    try:
+        out = await asyncio.to_thread(run, args)
+    except subprocess.TimeoutExpired:
+        raise RequestError("unavailable", "creating the profile took too long")
+    finally:
+        _creating.discard(name)
+    if out.returncode != 0:
+        raise RequestError("unavailable", last_line(out, "hermes profile create"))
+    _created[name] = time.monotonic()
+    log.info("3DS: created profile %s", name)
+    try:
+        out = await asyncio.to_thread(run, [cli, "-p", name, "config", "set", "platforms.3ds.enabled", "true"])
+        if out.returncode != 0:
+            log.warning("3DS: could not turn on the 3ds platform in %s: %s", name, last_line(out, "config set"))
+    except subprocess.TimeoutExpired:
+        log.warning("3DS: turning on the 3ds platform in %s took too long", name)
+    reconcile = getattr(runner, "reconcile_served_profiles", None)
+    if callable(reconcile):  # the gateway also rescans on its own; this makes the new bot reachable right away
+        with contextlib.suppress(Exception):
+            await reconcile(reason="3ds-create")
+    return await asyncio.to_thread(_agent_info, name, agent_home(runner, name), False)
 
 
 # --- sessions -------------------------------------------------------------------

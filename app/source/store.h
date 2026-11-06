@@ -19,6 +19,7 @@ void store_forget_server(void);
 typedef struct {
     bool sounds;         // UI sounds (reply arrived, needs you, sent, recording)
     bool speak_replies;  // play Hermes' spoken replies as they arrive
+    char agent[68];      // the bot last selected ("" for the main agent), protocol.md §4.8
 } Settings;
 
 void store_load_settings(Settings *s);

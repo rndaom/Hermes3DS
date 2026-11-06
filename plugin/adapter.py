@@ -15,6 +15,7 @@ import socket
 import subprocess
 import sys
 import time
+import types
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -25,6 +26,7 @@ from gateway.platforms.event import MessageEvent, MessageType
 from . import compat, speech
 from .h3proto.away import AwayManager, effective_mode, parse_address, parse_mode
 from .h3proto.audio import MAX_SECONDS as MAX_SPEECH_SECONDS, ffmpeg_path, voice_to_wav
+from .h3proto import avatar
 from .h3proto.blobs import BlobStore
 from .h3proto import fetch
 from .h3proto.media import (build_attachment, build_attachment_bytes, build_speech_attachment, clean_name,
@@ -70,8 +72,16 @@ def _data_dir():
     return plugin_data_dir(PLATFORM)
 
 
-def chat_id_for(device: Device) -> str:
-    return f"dev:{device.fp}"
+def chat_id_for(device: Device, agent: Optional[str] = None) -> str:
+    """The Hermes chat of a device: `dev:<fp>` with the main agent, `dev:<fp>/<profile>` with a bot (protocol.md
+    §4.8). Hermes keys sessions by profile already; the suffix is what tells the 3DS whose reply a send is."""
+    return f"dev:{device.fp}/{agent}" if agent else f"dev:{device.fp}"
+
+
+def split_chat_id(chat_id: str) -> tuple[str, str]:
+    """`dev:<fp>/<profile>` → (`dev:<fp>`, `<profile>`); the main agent's chat has "" for the profile."""
+    base, _, agent = str(chat_id).partition("/")
+    return base, agent
 
 
 def _strip_cursor(text: str) -> tuple[str, bool]:
@@ -159,12 +169,57 @@ class _Speech:
         return len(self.pcm) / (2.0 * self.audio_format.sample_rate)
 
 
+# Bots (protocol.md §4.8). A multiplexed gateway builds one adapter per served profile and lets a profile's turns
+# in only through that profile's own adapter. There is one listener (one port, one pairing), owned by the main
+# profile's adapter; a bot's adapter binds nothing and shares the listener's state, and the listener hands a
+# bot's messages to it. Each profile loads its own copy of this plugin (`hermes profile create --clone` copies
+# plugins), so they meet in a process-wide hub rather than in this module. Only copies of the same release work
+# together (COPY): a bot's copy calls the listener's server with that release's arguments and reads its shared
+# state by that release's names. Bump STATE_LAYOUT when the shared attributes below change between dev builds.
+STATE_LAYOUT = 1
+
+
+def _plugin_version() -> str:
+    with contextlib.suppress(OSError):
+        for line in Path(__file__).with_name("plugin.yaml").read_text(encoding="utf-8").splitlines():
+            if line.startswith("version:"):
+                return line.split(":", 1)[1].strip().strip("\"'")
+    return ""
+
+
+COPY = (STATE_LAYOUT, _plugin_version())
+_HUB = sys.modules.setdefault("hermes3ds_bots_hub", types.ModuleType("hermes3ds_bots_hub"))
+if not hasattr(_HUB, "bots"):
+    _HUB.listener = None  # the main profile's adapter, which owns the listener
+    _HUB.bots = {}        # served bot profile -> its adapter
+
+
+def _shared(name: str) -> property:
+    """Transport state a bot's adapter reads from the listener's adapter (its own copy until there is one)."""
+    own = "_own" + name
+
+    def get(self):
+        listener = _HUB.listener
+        src = listener if getattr(self, "_bot_profile", None) and listener is not None else self
+        try:
+            return src.__dict__[own]
+        except KeyError:
+            raise AttributeError(name) from None
+
+    def put(self, value):
+        self.__dict__[own] = value
+
+    return property(get, put)
+
+
 class ThreeDSAdapter(BasePlatformAdapter):
     SUPPORTS_MESSAGE_EDITING = True
     supports_status_text = True
     REQUIRES_EDIT_FINALIZE = True
     MAX_MESSAGE_LENGTH = _MAX_CHARS
     speech_groups = True  # config `speech_groups`: post a spoken reply in parts as it is written (see speech.py)
+    _bot_profile: Optional[str] = None  # set for a bot's adapter (set_owner_profile)
+    COPY = COPY
 
     def __init__(self, config, **kwargs):
         super().__init__(config=config, platform=Platform(PLATFORM))
@@ -196,9 +251,38 @@ class ThreeDSAdapter(BasePlatformAdapter):
     def name(self) -> str:
         return "Nintendo 3DS"
 
+    def set_owner_profile(self, profile_name: Optional[str]) -> None:
+        """The multiplexed gateway names the profile a secondary adapter serves: this one is that bot's."""
+        super().set_owner_profile(profile_name)
+        name = (profile_name or "").strip()
+        self._bot_profile = name if name and name != "default" else None
+
+    def _receiver(self, agent: Optional[str]) -> Optional["ThreeDSAdapter"]:
+        """The adapter a chat's turns enter Hermes through: the bot's own, or this one for the main agent."""
+        if not agent:
+            return self
+        bot = _HUB.bots.get(agent)
+        return bot if bot is not None and bot is not self else None
+
     # --- lifecycle --------------------------------------------------------------
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
+        if self._bot_profile:  # served through the main profile's listener
+            listener = _HUB.listener
+            if listener is None:  # the gateway starts the main profile's adapters first
+                self._set_fatal_error("no_listener", f"profile {self._bot_profile} runs the 3ds platform but the main "
+                                      "profile doesn't: bots answer through the main profile's 3DS listener, so turn "
+                                      "3ds on there", retryable=True)
+                return False
+            if getattr(listener, "COPY", None) != COPY:
+                self._set_fatal_error("plugin_mismatch", f"profile {self._bot_profile} has another version of the "
+                                      "3ds plugin than the main profile: update its copy", retryable=False)
+                return False
+            _HUB.bots[self._bot_profile] = self
+            self._mark_connected()
+            self._wire_plugin_handlers(None)  # handlers other plugins register for the 3ds platform, as the main one
+            logger.info("3DS: bot %s answers through the main listener", self._bot_profile)
+            return True
         if not self._acquire_platform_lock(PLATFORM, f"port:{self.port}", f"3DS listener on port {self.port}"):
             return False
         self._loop = asyncio.get_running_loop()
@@ -228,6 +312,12 @@ class ThreeDSAdapter(BasePlatformAdapter):
                                   f"port 127.0.0.1:{self.away_port}: {exc}", retryable=False)
             return False
         self._server = server
+        _HUB.listener = self
+        for name, bot in list(_HUB.bots.items()):  # bots that came up against an earlier listener
+            if getattr(bot, "COPY", None) != COPY:
+                del _HUB.bots[name]
+                logger.warning("3DS: bot %s has another version of the 3ds plugin than the main profile: update "
+                               "its copy", name)
         for dev in server.devices.all():
             self._chat_keys[chat_id_for(dev)] = dev.key
             self._chat_names[chat_id_for(dev)] = dev.name
@@ -247,6 +337,20 @@ class ThreeDSAdapter(BasePlatformAdapter):
         return True
 
     async def disconnect(self) -> None:
+        if self._bot_profile:
+            if _HUB.bots.get(self._bot_profile) is self:
+                del _HUB.bots[self._bot_profile]
+                # Its turns are gone with it: drop the approval cards and questions the 3DS still shows for it.
+                for req, card in list(self._approval_cards.items()):
+                    if split_chat_id(card[0])[1] == self._bot_profile:
+                        self._approval_cards.pop(req, None)
+                if self._server is not None:
+                    with contextlib.suppress(Exception):
+                        await self._server.clear_agent_pending(self._bot_profile)
+            self._mark_disconnected()
+            return
+        if _HUB.listener is self:
+            _HUB.listener = None
         with contextlib.suppress(Exception):
             self._release_platform_lock()
         self._mark_disconnected()
@@ -258,12 +362,24 @@ class ThreeDSAdapter(BasePlatformAdapter):
             self._server = None
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
-        return {"name": self._chat_names.get(chat_id, chat_id), "type": "dm"}
+        return {"name": self._chat_names.get(split_chat_id(chat_id)[0], chat_id), "type": "dm"}
 
     # --- helpers ----------------------------------------------------------------
 
     def _key(self, chat_id: str) -> Optional[bytes]:
-        return self._chat_keys.get(chat_id)
+        return self._chat_keys.get(split_chat_id(chat_id)[0])
+
+    def _agent(self, chat_id: str) -> str:
+        """The bot a chat belongs to ("" = the main agent); events for its chat carry it (protocol.md §4.8). A bot's
+        adapter sending to a plain `dev:<fp>` (an explicit `3ds:` target, a home channel copied into its profile)
+        still speaks as that bot, not into the main agent's chat."""
+        return split_chat_id(chat_id)[1] or (self._bot_profile or "")
+
+    def _tag(self, ev: dict, chat_id: str) -> dict:
+        agent = self._agent(chat_id)
+        if agent:
+            ev["agent"] = agent
+        return ev
 
     def _mid(self, prefix: str = "m") -> str:
         return f"{prefix}{getattr(self, '_run_tag', _RUN_TAG)}-{next(self._ids)}"
@@ -278,12 +394,19 @@ class ThreeDSAdapter(BasePlatformAdapter):
             with open(self._trace_path, "a", encoding="utf-8") as fh:
                 fh.write(line + "\n")
 
-    def source_for(self, device: Device):
-        cid = chat_id_for(device)
+    def source_for(self, device: Device, agent: Optional[str] = None):
+        cid = chat_id_for(device, agent)
         # The device proved its identity with its paired static key (Noise IK), so the adapter
-        # vouches for it; no Hermes allowlist entry is needed.
-        return self.build_source(chat_id=cid, chat_name=device.name, chat_type="dm", user_id=device.fp,
-                                 user_name=device.name, role_authorized=True)
+        # vouches for it; no Hermes allowlist entry is needed. A bot's source comes from the bot's adapter,
+        # which Hermes then treats as the one that received it.
+        source = (self._receiver(agent) or self).build_source(chat_id=cid, chat_name=device.name, chat_type="dm", user_id=device.fp,
+                                   user_name=device.name, role_authorized=True)
+        if agent:
+            # A bot's chat runs as that profile (Hermes' admission checks that it is the receiving adapter's): the
+            # turn runs under the bot's home and secrets, its session is keyed in the bot's namespace, and the reply
+            # goes out through the bot's adapter.
+            source.profile = agent
+        return source
 
     async def reauthorize_native_roles(self, source) -> bool:
         """Hermes' session authority re-checks a role_authorized source before it runs a turn (and when
@@ -292,8 +415,10 @@ class ThreeDSAdapter(BasePlatformAdapter):
         server = self._server
         if server is None or source.chat_type != "dm":
             return False
-        return any(dev.fp == source.user_id and chat_id_for(dev) == source.chat_id
-                   for dev in server.devices.all())
+        base, agent = split_chat_id(source.chat_id)
+        if agent and (source.profile or "") != agent:  # a bot's chat only ever runs as that bot
+            return False
+        return any(dev.fp == source.user_id and chat_id_for(dev) == base for dev in server.devices.all())
 
     def register_device(self, device: Device) -> str:
         cid = chat_id_for(device)
@@ -301,12 +426,20 @@ class ThreeDSAdapter(BasePlatformAdapter):
         self._chat_names[cid] = device.name
         return cid
 
-    async def inject_text(self, device: Device, text: str) -> str:
+    async def inject_text(self, device: Device, text: str, agent: Optional[str] = None) -> str:
         mid = self._mid("u")
-        event = MessageEvent(text=text, message_type=MessageType.TEXT, source=self.source_for(device),
+        event = MessageEvent(text=text, message_type=MessageType.TEXT, source=self.source_for(device, agent),
                              message_id=mid, timestamp=datetime.datetime.now())
-        await self.handle_message(event)
+        await self._entry(agent).handle_message(event)
         return mid
+
+    def _entry(self, agent: Optional[str]) -> "ThreeDSAdapter":
+        receiver = self._receiver(agent)
+        if receiver is None:
+            raise RequestError("unavailable", f"{agent} isn't reachable from the 3DS: its profile needs the 3ds "
+                                              f"platform on (hermes -p {agent} config set platforms.3ds.enabled true) "
+                                              "and the same 3ds plugin version as the main profile")
+        return receiver
 
     def _upload(self, device: Device, ref: Any) -> Path:
         bid = str(ref.get("blob") if isinstance(ref, dict) else "")
@@ -315,7 +448,7 @@ class ThreeDSAdapter(BasePlatformAdapter):
             raise RequestError("not_found", f"upload {bid!r} isn't complete on the PC")
         return path
 
-    async def inject_voice(self, device: Device, voice: dict, text: str, req: Any) -> str:
+    async def inject_voice(self, device: Device, voice: dict, text: str, req: Any, agent: Optional[str] = None) -> str:
         """A voice message (protocol.md §4.4): IMA-ADPCM upload → WAV → Hermes' audio cache → a VOICE event, so
         the gateway's speech-to-text transcribes it. Its transcript echo becomes a `heard` event."""
         from gateway.platforms.base import cache_audio_from_bytes_async
@@ -327,19 +460,19 @@ class ThreeDSAdapter(BasePlatformAdapter):
             raise RequestError("bad_request", f"bad voice message: {exc}")
         cached = await cache_audio_from_bytes_async(wav, ".wav")
         mid = self._mid("u")
-        cid = chat_id_for(device)
+        cid = chat_id_for(device, agent)
         if isinstance(req, int):
             now = time.monotonic()
             waiting = [w for w in self._awaiting_heard.get(cid, []) if now - w[0] < HEARD_WAIT][-7:]
             self._awaiting_heard[cid] = waiting + [(now, req)]
         self._trace("voice", chat_id=cid, mid=mid, path=cached, ms=ms, bytes=len(wav))
-        event = MessageEvent(text=text, message_type=MessageType.VOICE, source=self.source_for(device),
+        event = MessageEvent(text=text, message_type=MessageType.VOICE, source=self.source_for(device, agent),
                              message_id=mid, timestamp=datetime.datetime.now(), media_urls=[cached],
                              media_types=["audio/wav"])
-        await self.handle_message(event)
+        await self._entry(agent).handle_message(event)
         return mid
 
-    async def inject_photos(self, device: Device, refs: list, text: str) -> str:
+    async def inject_photos(self, device: Device, refs: list, text: str, agent: Optional[str] = None) -> str:
         """Photos from the 3DS camera (protocol.md §4.4 `attach`) → Hermes' image cache → a PHOTO event (vision)."""
         from gateway.platforms.base import cache_image_from_bytes_async
         urls, types = [], []
@@ -353,10 +486,10 @@ class ThreeDSAdapter(BasePlatformAdapter):
                 raise RequestError("bad_request", f"not a picture: {exc}")
             types.append("image/png" if png else "image/jpeg")
         mid = self._mid("u")
-        self._trace("photos", chat_id=chat_id_for(device), mid=mid, paths=urls, text=text)
-        event = MessageEvent(text=text, message_type=MessageType.PHOTO, source=self.source_for(device),
+        self._trace("photos", chat_id=chat_id_for(device, agent), mid=mid, paths=urls, text=text)
+        event = MessageEvent(text=text, message_type=MessageType.PHOTO, source=self.source_for(device, agent),
                              message_id=mid, timestamp=datetime.datetime.now(), media_urls=urls, media_types=types)
-        await self.handle_message(event)
+        await self._entry(agent).handle_message(event)
         return mid
 
     async def _deliver_heard(self, chat_id: str, key: bytes, text: str) -> bool:
@@ -368,7 +501,7 @@ class ThreeDSAdapter(BasePlatformAdapter):
             return False
         _, req = waiting.pop(0)
         self._awaiting_heard[chat_id] = waiting
-        await self._server.event(key, {"t": "heard", "req": req, "text": emoji_for_3ds(text)[:4000]})
+        await self._server.event(key, self._tag({"t": "heard", "req": req, "text": emoji_for_3ds(text)[:4000]}, chat_id))
         return True
 
     async def on_processing_start(self, event: MessageEvent) -> None:
@@ -393,12 +526,13 @@ class ThreeDSAdapter(BasePlatformAdapter):
         text = _hide_media(text, final=not streaming)
         mid = self._mid()
         self._trace("send", chat_id=chat_id, mid=mid, streaming=streaming, content=content, metadata=metadata)
+        agent = self._agent(chat_id)
         if streaming:
             rich, spans = stream_to_rich(text.lstrip())
-            await self._server.post_message(key, mid, rich, final=False, spans=spans or None)
+            await self._server.post_message(key, mid, rich, final=False, spans=spans or None, agent=agent)
         else:
             rich, spans = markdown_to_rich(text.strip())
-            await self._server.post_message(key, mid, rich, final=True, spans=spans or None)
+            await self._server.post_message(key, mid, rich, final=True, spans=spans or None, agent=agent)
         return SendResult(success=True, message_id=mid)
 
     async def edit_message(self, chat_id: str, message_id: str, content: str, *,
@@ -413,7 +547,8 @@ class ThreeDSAdapter(BasePlatformAdapter):
             await self._server.clear_pending(key, message_id,
                                              {"t": "approval_done", "req": message_id, "choice": "timeout"})
             rich, spans = markdown_to_rich(content)
-            await self._server.post_message(key, self._mid(), rich, role="system", kind="notice", spans=spans or None)
+            await self._server.post_message(key, self._mid(), rich, role="system", kind="notice", spans=spans or None,
+                                            agent=self._agent(chat_id))
             return SendResult(success=True, message_id=message_id)
         text, streaming = _strip_cursor(content)
         final = finalize or not streaming
@@ -435,12 +570,12 @@ class ThreeDSAdapter(BasePlatformAdapter):
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         key = self._key(chat_id)
         if key is not None and self._server is not None:
-            await self._server.set_typing(key, True)
+            await self._server.set_typing(key, True, self._agent(chat_id))
 
     async def stop_typing(self, chat_id: str) -> None:
         key = self._key(chat_id)
         if key is not None and self._server is not None:
-            await self._server.set_typing(key, False)
+            await self._server.set_typing(key, False, self._agent(chat_id))
 
     # --- outbound: media (protocol.md §4.7) -------------------------------------------------
 
@@ -453,11 +588,12 @@ class ThreeDSAdapter(BasePlatformAdapter):
         rich, spans = markdown_to_rich(text) if text else ("", [])
         # Hermes streams the reply before delivering its MEDIA files and never finalizes a preview that held
         # nothing but the (hidden) tag; drop such blank bubbles so they don't sit open in the chat.
-        for blank in self._server.open_blank_messages(key):
+        agent = self._agent(chat_id)
+        for blank in self._server.open_blank_messages(key, agent):
             await self._server.delete_message(key, blank)
         mid = self._mid()
         self._trace("send_media", chat_id=chat_id, mid=mid, caption=caption, attach=attach)
-        await self._server.post_message(key, mid, rich, final=True, spans=spans or None, attach=attach)
+        await self._server.post_message(key, mid, rich, final=True, spans=spans or None, attach=attach, agent=agent)
         return SendResult(success=True, message_id=mid)
 
     async def _send_local(self, chat_id: str, path: str, caption: Optional[str], *, name: Optional[str] = None,
@@ -554,13 +690,13 @@ class ThreeDSAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="the spoken reply could not be converted for the 3DS")
         att["voice"] = True
         self._trace("speech", chat_id=chat_id, ms=att.get("ms"), file=p.name)
-        await self._server.event(key, {"t": "speak", "speech": self._mid("s"), "attach": att})
+        await self._server.event(key, self._tag({"t": "speak", "speech": self._mid("s"), "attach": att}, chat_id))
         return SendResult(success=True)
 
     # --- spoken replies as they are written (Hermes' streaming TTS; see speech.py) ------------------
 
     def supports_streaming_tts(self, chat_id: str, audio_format: Any) -> bool:
-        return (self._blobs is not None and self._server is not None and chat_id in self._chat_keys
+        return (self._blobs is not None and self._server is not None and self._key(chat_id) is not None
                 and ffmpeg_path() is not None and audio_format.channels == 1 and audio_format.sample_width == 2
                 and 4000 <= audio_format.sample_rate <= 48000)
 
@@ -614,7 +750,8 @@ class ThreeDSAdapter(BasePlatformAdapter):
                 self._trace("speech", chat_id=handle.chat_id, ms=att["ms"], pcm=len(pcm), part=handle.posts + 1)
                 key = self._key(handle.chat_id)
                 if handle.speech_id and key is not None and self._server is not None:
-                    await self._server.event(key, {"t": "speak", "speech": handle.speech_id, "attach": att})
+                    await self._server.event(key, self._tag({"t": "speak", "speech": handle.speech_id, "attach": att},
+                                                            handle.chat_id))
                 elif not handle.speech_id:
                     await self._post_attachments(handle.chat_id, [att], None)
             except Exception as exc:
@@ -721,6 +858,7 @@ class ThreeDSAdapter(BasePlatformAdapter):
         if key is None or self._server is None or self._loop is None:
             return
         ev = {"t": "tool", "state": "start", "text": emoji_for_3ds(str(text))[:160]} if text else {"t": "tool", "state": "done"}
+        self._tag(ev, chat_id)
         self._trace("status", chat_id=chat_id, text=text)
         try:
             asyncio.run_coroutine_threadsafe(self._server.event(key, ev), self._loop)
@@ -736,10 +874,10 @@ class ThreeDSAdapter(BasePlatformAdapter):
         req = self._mid("a")
         # Hermes 0.23+ names the request the card answers; 0.22.x sends no id (FIFO, below).
         self._approval_cards[req] = (prompt.chat_id, prompt.session_key, getattr(prompt, "request_id", None))
-        await self._server.set_pending(key, req, {
+        await self._server.set_pending(key, req, self._tag({
             "t": "approval", "req": req, "text": markdown_to_rich(_cut(prompt.text, 4000))[0],
             "command": _cut(prompt.command, 8000), "description": _cut(prompt.description, 1000), "actions": [list(a) for a in prompt.actions],
-        })
+        }, prompt.chat_id))
         return SendResult(success=True, message_id=req)
 
     async def resolve_approval(self, device: Device, req: str, choice: str) -> int:
@@ -773,19 +911,20 @@ class ThreeDSAdapter(BasePlatformAdapter):
             with contextlib.suppress(Exception):
                 from tools.clarify_gateway import mark_awaiting_text
                 mark_awaiting_text(clarify_id)
-        await self._server.set_pending(key, f"c:{clarify_id}", {
+        await self._server.set_pending(key, f"c:{clarify_id}", self._tag({
             "t": "clarify", "cid": clarify_id, "question": markdown_to_rich(question)[0],
             "choices": [str(c) for c in (choices or [])], "multi": multi,
-        })
+        }, chat_id))
         return SendResult(success=True, message_id=f"c:{clarify_id}")
 
     async def retire_clarify_card(self, clarify_id: str, notice: Optional[str] = None) -> None:
         for cid, key in list(self._chat_keys.items()):
-            if self._server and self._server.pending(key, f"c:{clarify_id}") is not None:
+            prompt = self._server.pending(key, f"c:{clarify_id}") if self._server else None
+            if prompt is not None:
                 await self._server.clear_pending(key, f"c:{clarify_id}", {"t": "clarify_done", "cid": clarify_id})
                 if notice:
                     await self._server.post_message(key, self._mid(), markdown_to_rich(notice)[0],
-                                                    role="system", kind="notice")
+                                                    role="system", kind="notice", agent=str(prompt.get("agent") or ""))
 
     async def answer_clarify(self, device: Device, cid: str, choice: Optional[int], text: Optional[str],
                              picks: Optional[list[int]] = None) -> bool:
@@ -818,11 +957,22 @@ class ThreeDSAdapter(BasePlatformAdapter):
         return ok
 
 
+for _n in ("_server", "_chat_keys", "_chat_names", "_queued", "_loop", "_trace_path", "_approval_cards", "_blobs",
+           "_awaiting_heard", "_ids", "_run_tag"):
+    setattr(ThreeDSAdapter, _n, _shared(_n))
+del _n
+
+
 class _Backend:
     """Request handling for one adapter (protocol.md §4.4–4.6)."""
 
+    # Answered beside the device's read loop: making a profile takes seconds to minutes, and meanwhile the device's
+    # pings, sends and approvals must still get through.
+    slow_requests = frozenset({"agents.create"})
+
     def __init__(self, adapter: ThreeDSAdapter):
         self.a = adapter
+        self._avatars: dict[str, tuple[Any, dict[str, Any]]] = {}  # profile -> (what it was drawn from, blob ref)
 
     async def welcome_state(self, device: Device) -> dict[str, Any]:
         self.a.register_device(device)
@@ -851,13 +1001,89 @@ class _Backend:
             raise RequestError("unavailable", "gateway runner not ready")
         return runner
 
-    def _busy(self, device: Device) -> bool:
+    def _busy(self, device: Device, agent: Optional[str] = None) -> bool:
         with contextlib.suppress(Exception):
-            key = self.a._source_session_key(self.a.source_for(device))
-            return key in self.a._active_sessions
+            receiver = self.a._receiver(agent) or self.a  # a bot's turns run on its own adapter
+            key = receiver._source_session_key(self.a.source_for(device, agent))
+            return key in receiver._active_sessions
         return False
 
+    def _agent(self, msg: dict[str, Any]) -> Optional[str]:
+        """The bot a request is for (protocol.md §4.8): None for the main agent, else a profile this gateway serves."""
+        name = msg.get("agent")
+        if name is None or name == "":
+            return None
+        if not isinstance(name, str) or not compat.PROFILE_ID.match(name):
+            raise RequestError("bad_request", "bad agent name")
+        runner = getattr(self.a, "gateway_runner", None)
+        served = compat.served_agents(runner) if runner is not None else []
+        if served and name == served[0]:
+            return None
+        if name not in served[1:]:
+            raise RequestError("not_found", f"no bot called {name} on this gateway")
+        return name
+
+    def _avatar(self, item: dict[str, Any]) -> None:
+        """Swap the item's `_look` for `avatar`, the blob of its picture. A picture is drawn once per look and
+        reused while its blob lasts (blobs expire after a week; the gateway runs for longer). Blocking."""
+        spec = item.pop("_look", None)
+        store = getattr(self.a, "_blobs", None)
+        if not spec or store is None:
+            return
+        key = (spec["photo"], spec["stamp"], spec["shape"], tuple(spec["color"]))
+        hit = self._avatars.get(item["id"])
+        meta = store.meta(hit[1]["id"]) if hit and hit[0] == key else None
+        if meta is not None and time.time() - float(meta.get("created", 0)) < store.ttl / 2:
+            item["avatar"] = hit[1]
+            return
+        png = avatar.render(spec)
+        if png is None:
+            return
+        ref = store.put_bytes(png, "image/png", f"{item['id']}.png", "thumb")
+        self._avatars[item["id"]] = (key, ref)
+        item["avatar"] = ref
+
+    async def _agents(self, device: Device) -> dict[str, Any]:
+        """The roster with this device's live state per bot: a turn running, Hermes speaking its replies."""
+        out = await compat.agents_list(self._runner())
+        await asyncio.to_thread(lambda: [self._avatar(it) for it in out["items"]])
+        for it in out["items"]:
+            self._live(device, it)
+        return out
+
+    def _live(self, device: Device, it: dict[str, Any]) -> None:
+        agent = None if it["primary"] else it["id"]
+        receiver = self.a._receiver(agent)
+        it["busy"] = self._busy(device, agent)
+        it["ready"] = receiver is not None  # its turns have a way in (its profile runs the 3ds platform)
+        speaks = getattr(receiver, "_should_auto_tts_for_chat", None)  # /voice is kept per adapter
+        if callable(speaks):
+            with contextlib.suppress(Exception):
+                it["voice"] = bool(speaks(chat_id_for(device, agent)))
+
     async def handle(self, device: Device, msg: dict[str, Any]) -> dict[str, Any] | None:
+        t = msg["t"]
+        if t == "agents.list":
+            return {"t": "agents.list_r", **await self._agents(device)}
+        if t == "agents.create":
+            name = compat.slug(str(msg.get("name") or ""))
+            desc = " ".join(str(msg.get("desc") or "").split())
+            item = await compat.agents_create(self._runner(), name, desc)
+            await asyncio.to_thread(self._avatar, item)
+            self._live(device, item)
+            return {"t": "agents.create_r", "item": item}
+        if t in ("approve", "answer"):  # keyed by the prompt itself; a bot that left can still have its card cleared
+            return await self._handle(device, msg, None)
+        agent = self._agent(msg)
+        if agent is None:
+            return await self._handle(device, msg, None)
+        # Only profiles that run the 3ds platform themselves are open to the 3DS: Bot Mode lists every profile, but
+        # one that never turned 3ds on keeps its sessions, skills and jobs to itself.
+        self.a._entry(agent)
+        async with compat.profile_scope(compat.agent_home(self._runner(), agent)):
+            return await self._handle(device, msg, agent)
+
+    async def _handle(self, device: Device, msg: dict[str, Any], agent: Optional[str]) -> dict[str, Any] | None:
         t = msg["t"]
         a = self.a
 
@@ -867,8 +1093,8 @@ class _Backend:
         if t == "send":
             # Count what waits behind a running turn; Hermes may merge queued messages into one turn, so the
             # count is only trusted while the chat is busy and starts over when it isn't.
-            cid = chat_id_for(device)
-            a._queued[cid] = a._queued.get(cid, 0) + 1 if self._busy(device) else 0
+            cid = chat_id_for(device, agent)
+            a._queued[cid] = a._queued.get(cid, 0) + 1 if self._busy(device, agent) else 0
             text = str(msg.get("text") or "").strip()
             voice, attach = msg.get("voice"), msg.get("attach")
             if len(text) > 16000:
@@ -876,16 +1102,16 @@ class _Backend:
             if voice is not None:
                 if not isinstance(voice, dict):
                     raise RequestError("bad_request", "voice must be an object")
-                return {"t": "send_r", "mid": await a.inject_voice(device, voice, text, msg.get("id"))}
+                return {"t": "send_r", "mid": await a.inject_voice(device, voice, text, msg.get("id"), agent)}
             if attach is not None:
                 if not isinstance(attach, list) or not attach or len(attach) > PHOTOS_PER_SEND:
                     raise RequestError("bad_request", f"attach must list 1 to {PHOTOS_PER_SEND} uploads")
-                return {"t": "send_r", "mid": await a.inject_photos(device, attach, text)}
+                return {"t": "send_r", "mid": await a.inject_photos(device, attach, text, agent)}
             if not text:
                 raise RequestError("bad_request", "empty message")
-            return {"t": "send_r", "mid": await a.inject_text(device, text)}
+            return {"t": "send_r", "mid": await a.inject_text(device, text, agent)}
         if t == "stop":
-            await a.inject_text(device, "/stop")
+            await a.inject_text(device, "/stop", agent)
             return {"t": "stop_r"}
         if t == "blob.open":
             await a.open_blob(str(msg.get("blob")))
@@ -902,10 +1128,10 @@ class _Backend:
             return {"t": "answer_r", "ok": ok}
 
         runner = self._runner()
-        source = a.source_for(device)
+        source = a.source_for(device, agent)
         if t == "status":
-            busy = self._busy(device)
-            queued = getattr(a, "_queued", {}).get(chat_id_for(device), 0) if busy else 0
+            busy = self._busy(device, agent)
+            queued = getattr(a, "_queued", {}).get(chat_id_for(device, agent), 0) if busy else 0
             return {"t": "status_r", "now": time.time(), **await compat.status(runner, source, busy, queued)}
         if t == "sessions.list":
             off, lim = page()
@@ -920,11 +1146,11 @@ class _Backend:
             sid = str(msg.get("sid") or "").strip()
             if not sid or any(c.isspace() for c in sid):
                 raise RequestError("bad_request", "bad session id")
-            await a.inject_text(device, f"/resume {sid}")
+            await a.inject_text(device, f"/resume {sid}", agent)
             return {"t": "sessions.resume_r"}
         if t == "sessions.new":
             title = " ".join(str(msg.get("title") or "").split())[:80]
-            await a.inject_text(device, f"/new {title}".strip())
+            await a.inject_text(device, f"/new {title}".strip(), agent)
             return {"t": "sessions.new_r"}
         if t == "commands.list":
             return {"t": "commands.list_r", "items": await compat.commands_list()}

@@ -241,7 +241,7 @@ class _UploadServer:
     async def event(self, key, msg):
         self.events.append(msg)
 
-    def open_blank_messages(self, key):
+    def open_blank_messages(self, key, agent=""):
         return []
 
     async def post_message(self, key, mid, text, **kw):
@@ -279,7 +279,7 @@ def ad(adapter_mod, tmp_path, monkeypatch):  # noqa: F811
         a.handled.append(event)
 
     a.handle_message = handle_message
-    a.source_for = lambda device: "src"
+    a.source_for = lambda device, agent=None: "src"
     return a
 
 
@@ -362,7 +362,7 @@ def test_welcome_says_whether_hermes_speaks_in_this_chat(ad):
 def test_queued_counts_messages_sent_during_a_turn(ad, adapter_mod):
     backend = adapter_mod._Backend(ad)
     busy = [False]
-    backend._busy = lambda device: busy[0]
+    backend._busy = lambda device, agent=None: busy[0]
     send = {"t": "send", "id": 1, "text": "hi"}
     asyncio.run(backend.handle(_device(), send))
     assert ad._queued == {"dev:fp1": 0}

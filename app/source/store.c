@@ -107,17 +107,20 @@ void store_load_settings(Settings *s)
 {
     s->sounds = true;
     s->speak_replies = true;
+    s->agent[0] = 0;
     json_t *j = json_load_file(SETTINGS_PATH, 0, NULL);
     if (!j) return;
     json_t *v;
     if (json_is_boolean(v = json_object_get(j, "sounds"))) s->sounds = json_is_true(v);
     if (json_is_boolean(v = json_object_get(j, "speak_replies"))) s->speak_replies = json_is_true(v);
+    if (json_is_string(v = json_object_get(j, "agent"))) snprintf(s->agent, sizeof s->agent, "%s", json_string_value(v));
     json_decref(j);
 }
 
 bool store_save_settings(const Settings *s)
 {
-    json_t *j = json_pack("{s:b, s:b}", "sounds", s->sounds, "speak_replies", s->speak_replies);
+    json_t *j = json_pack("{s:b, s:b, s:s}", "sounds", s->sounds, "speak_replies", s->speak_replies,
+                          "agent", s->agent);
     char *text = json_dumps(j, JSON_INDENT(1));
     json_decref(j);
     bool ok = text && write_atomic(SETTINGS_PATH, text, strlen(text));

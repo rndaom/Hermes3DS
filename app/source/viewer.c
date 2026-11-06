@@ -82,8 +82,8 @@ static const char *js(const json_t *o, const char *k)
 static void collect(void)
 {
     nfiles = 0;
-    for (int i = 0; i < app.chat.n; i++) {
-        const Msg *m = app.chat.m[i];
+    for (int i = 0; i < app.chat->n; i++) {
+        const Msg *m = app.chat->m[i];
         for (size_t k = 0; k < json_array_size(m->attach) && nfiles < MAX_FILES; k++)
             files[nfiles++] = (File){m, json_array_get(m->attach, k)};
     }
@@ -644,7 +644,7 @@ void viewer_draw_top(void)
     collect();
     int sel = sel_index();
     char title[128];
-    snprintf(title, sizeof title, "%s", app.chat.title[0] ? app.chat.title : "Files");
+    snprintf(title, sizeof title, "%s", app.chat->title[0] ? app.chat->title : "Files");
     if (sel < 0) {
         draw_header(title);
         return;
@@ -667,7 +667,9 @@ void viewer_draw_top(void)
     spaced(buf, INFO_X, y, S_EYE, COL_BLUE, 1.6f);
     y += 11;
     clock_text(f->m->local_time, when, sizeof when);
-    snprintf(buf, sizeof buf, "FROM %s%s%s", f->m->role == R_USER ? "YOU" : "HERMES", when[0] ? " · " : "", when);
+    char who[40];
+    agent_caps(app_agent(), who, sizeof who);
+    snprintf(buf, sizeof buf, "FROM %s%s%s", f->m->role == R_USER ? "YOU" : who, when[0] ? " · " : "", when);
     spaced(buf, INFO_X, y, S_EYE, COL_TX_3, 1.2f);
     y += 13;
     y += text_block(js(f->a, "name"), INFO_X, y, INFO_W, S_BODY, &BODY_COLORS, 2, NULL) + 2;

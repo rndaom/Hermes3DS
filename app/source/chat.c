@@ -241,6 +241,7 @@ void chat_handle(Chat *c, json_t *msg)
     if (!strcmp(t, "msg")) {
         mid_of(msg, mid);
         Msg *m = find(c, mid);  // offline replay re-sends changed messages with the same mid
+        bool created = !m;
         if (!m) {
             const char *role = jstr(msg, "role"), *kind = jstr(msg, "kind");
             m = msg_new(!strcmp(role, "assistant") && (!kind[0] || !strcmp(kind, "reply") || !strcmp(kind, "cron"))
@@ -249,7 +250,9 @@ void chat_handle(Chat *c, json_t *msg)
             snprintf(m->mid, sizeof m->mid, "%s", mid);
             push(c, m);
         }
-        bool fresh = m->len == 0 && m->shown == 0, was_final = m->final;
+        // A message new to this chat was never final here: a reply that arrives whole (streaming off, media, cron,
+        // or replayed after a sleep) counts as a reply just like a streamed one that ends.
+        bool fresh = m->len == 0 && m->shown == 0, was_final = !created && m->final;
         const char *text = jstr(msg, "text");
         set_text(m, text, strlen(text));
         set_spans(m, json_object_get(msg, "spans"));

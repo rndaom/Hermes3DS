@@ -215,7 +215,7 @@ class _FakeServer:
     def __init__(self):
         self.posted = []
 
-    def open_blank_messages(self, key):
+    def open_blank_messages(self, key, agent=""):
         return []
 
     async def post_message(self, key, mid, text, **kw):
