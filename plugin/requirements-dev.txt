@@ -1,5 +1,6 @@
 # Test dependencies for the plugin (`python -m pytest` in plugin/). Inside Hermes the gateway's own environment
-# already provides cryptography, PyYAML, Pillow, httpx and anydoc; these pins match what Hermes ships.
+# already provides cryptography, Pillow, httpx and anydoc, and reads YAML with its own `hermes_yaml` (PyYAML here
+# stands in for it); these pins match what Hermes ships.
 pytest
 pytest-asyncio
 cryptography

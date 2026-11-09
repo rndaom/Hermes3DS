@@ -96,3 +96,18 @@ def test_without_a_request_id_hermes_0_22_resolves_oldest_first(ad):
     assert asyncio.run(go()) == 1
     assert ad.calls == [("sess", "deny", None)]
     assert ad.queue["sess"] == ["r2"]
+
+
+def test_without_a_request_id_a_newer_card_waits_for_the_older_one(ad, adapter_mod):  # noqa: F811
+    """Hermes 0.22 answers the session's oldest request whichever card was tapped: the newer card must not."""
+    async def go():
+        first = (await ad._send_exec_approval_prompt(prompt())).message_id
+        second = (await ad._send_exec_approval_prompt(prompt())).message_id
+        with pytest.raises(adapter_mod.RequestError) as e:
+            await ad.resolve_approval(DEVICE, second, "deny")
+        assert e.value.code == "bad_request" and ad.calls == []
+        assert await ad.resolve_approval(DEVICE, first, "once") == 1
+        assert await ad.resolve_approval(DEVICE, second, "deny") == 1
+
+    asyncio.run(go())
+    assert ad.calls == [("sess", "once", None), ("sess", "deny", None)]

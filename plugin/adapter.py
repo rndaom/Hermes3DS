@@ -291,6 +291,7 @@ class ThreeDSAdapter(BasePlatformAdapter):
         try:
             static = load_or_create_key(data / "server_key")
         except Exception as exc:
+            self._release_platform_lock()
             self._set_fatal_error("key_error", f"cannot load 3DS server key: {exc}", retryable=False)
             return False
         try:
@@ -891,6 +892,9 @@ class ThreeDSAdapter(BasePlatformAdapter):
         if request_id:  # only this card's request: a stale card can't answer the next one in the queue
             n = resolve_gateway_approval(session_key, choice, request_id=request_id)
         else:  # Hermes 0.22.x: per session, oldest first (as its own buttons did)
+            oldest = next((r for r, c in self._approval_cards.items() if c[1] == session_key), req)
+            if oldest != req:  # Hermes would apply this answer to the older request, not the one tapped
+                raise RequestError("bad_request", "answer the earlier request first")
             n = resolve_gateway_approval(session_key, choice)
         self._approval_cards.pop(req, None)
         # n == 0: the request already settled (timed out, or /approve answered it), so nothing ran.
@@ -1002,11 +1006,15 @@ class _Backend:
         return runner
 
     def _busy(self, device: Device, agent: Optional[str] = None) -> bool:
-        with contextlib.suppress(Exception):
+        try:
             receiver = self.a._receiver(agent) or self.a  # a bot's turns run on its own adapter
             key = receiver._source_session_key(self.a.source_for(device, agent))
             return key in receiver._active_sessions
-        return False
+        except Exception as exc:  # Hermes internals: if they move, say so once instead of "never busy" in silence
+            if not getattr(self, "_busy_warned", False):
+                self._busy_warned = True
+                logger.warning("3DS: cannot tell whether a turn is running (%s): the busy mark stays off", exc)
+            return False
 
     def _agent(self, msg: dict[str, Any]) -> Optional[str]:
         """The bot a request is for (protocol.md §4.8): None for the main agent, else a profile this gateway serves."""

@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+Plugin.
+
+- Bots keep their titles, descriptions, models and pictures on a stock Hermes: the roster reads `profile.yaml` and
+  `config.yaml` with Hermes's own `hermes_yaml` (Hermes does not ship PyYAML, which it used before), and says so
+  in the log when a file will not parse.
+- One bot is made at a time; a second request while one is being made is told to try again.
+- Bots are found when the gateway's main agent is itself a named profile (`hermes -p work gateway run`).
+- On Hermes 0.22, with two approval cards showing, the newer card waits for the older one instead of answering it.
+- Markdown files are sent as `text/markdown` on Python 3.11 and 3.12 too.
+- A server key that cannot be loaded no longer leaves the port's lock held.
+
 ## 0.2.0 (2026-11-06)
 
 App and plugin (0.2.0). Both ends need it for bots; either one still works with the other's older version, with

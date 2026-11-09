@@ -252,7 +252,7 @@ whose delimiter row hasn't arrived) is held back so raw pipes never show.
 
 ```json
 // client → server (handshake msg 1 payload, or first frame in plaintext mode)
-{"t":"hello","v":1,"app":"3ds-0.1.0","device":"Random's 3DS","model":"old3ds",
+{"t":"hello","v":1,"app":"3ds-0.2.0","device":"Random's 3DS","model":"old3ds",
  "screen":{"top":[400,240],"bottom":[320,240]},
  "caps":["emoji:7fa053d0","voiceq","speak"],
  "pair":"<base64url token, only when pairing>"}

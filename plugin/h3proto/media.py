@@ -35,6 +35,11 @@ def clean_name(name: str | None, fallback: str = "file") -> str:
     return base or fallback
 
 
+# Python before 3.13 does not know Markdown, and a host's mime.types may not either.
+mimetypes.add_type("text/markdown", ".md")
+mimetypes.add_type("text/markdown", ".markdown")
+
+
 def guess_mime(name: str) -> str:
     return mimetypes.guess_type(name)[0] or "application/octet-stream"
 

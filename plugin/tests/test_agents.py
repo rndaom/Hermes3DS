@@ -405,6 +405,31 @@ def test_agent_info_reads_bot_mode_metadata(adapter_mod, tmp_path):
     assert compat._agent_info("default", tmp_path, True)["_look"] is None  # the main agent keeps the caduceus
 
 
+def test_yaml_uses_hermes_own_reader(adapter_mod, tmp_path, monkeypatch, caplog):
+    """Hermes ships `hermes_yaml`, not PyYAML: the roster must read with it, and say so when nothing can."""
+    import sys
+    compat = adapter_mod.compat
+    f = tmp_path / "profile.yaml"
+    f.write_text("display_name: Scribe\n", encoding="utf-8")
+    compat._yaml_loader.cache_clear()
+    monkeypatch.setitem(sys.modules, "hermes_yaml", types.SimpleNamespace(safe_load=lambda text: {"via": "hermes"}))
+    monkeypatch.setitem(sys.modules, "yaml", None)  # as on a stock Hermes
+    assert compat._yaml(f) == {"via": "hermes"}
+    assert compat._yaml(tmp_path / "missing.yaml") == {}
+    compat._yaml_loader.cache_clear()
+    monkeypatch.setitem(sys.modules, "hermes_yaml", types.SimpleNamespace(safe_load=lambda text: 1 / 0))
+    with caplog.at_level("WARNING", logger="hermes3ds"):
+        assert compat._yaml(f) == {}  # a file that does not parse
+    assert "could not read" in caplog.text
+    compat._yaml_loader.cache_clear()
+    caplog.clear()
+    monkeypatch.setitem(sys.modules, "hermes_yaml", None)
+    with caplog.at_level("WARNING", logger="hermes3ds"):
+        assert compat._yaml(f) == {} and compat._yaml(f) == {}
+    assert caplog.text.count("no YAML reader") == 1  # said once, not per file
+    compat._yaml_loader.cache_clear()
+
+
 def test_create_refuses_what_hermes_would(adapter_mod):
     compat, RequestError = adapter_mod.compat, adapter_mod.RequestError
     with pytest.raises(RequestError) as e:
@@ -414,6 +439,37 @@ def test_create_refuses_what_hermes_would(adapter_mod):
         with pytest.raises(RequestError) as e:
             asyncio.run(compat.agents_create(_Runner(), bad, ""))
         assert e.value.code == "bad_request"
+
+
+def test_agent_home_when_the_main_agent_is_a_named_profile(adapter_mod, monkeypatch, tmp_path):
+    """`hermes -p work gateway run`: the other profiles are beside `work`, not inside it."""
+    import sys
+    compat = adapter_mod.compat
+    consts = types.ModuleType("hermes_constants")
+    consts.get_default_hermes_root = lambda: tmp_path
+    consts.get_process_hermes_home = lambda: tmp_path / "profiles" / "work"
+    monkeypatch.setitem(sys.modules, "hermes_constants", consts)
+    r = _Runner(served=("work", "default", "scribe"))
+    assert compat.agent_home(r, "work") == tmp_path / "profiles" / "work"
+    assert compat.agent_home(r, "default") == tmp_path
+    assert compat.agent_home(r, "scribe") == tmp_path / "profiles" / "scribe"
+    consts.get_process_hermes_home = lambda: tmp_path  # the usual setup: nothing changes
+    r = _Runner()
+    assert compat.agent_home(r, "default") == tmp_path
+    assert compat.agent_home(r, "research") == tmp_path / "profiles" / "research"
+
+
+def test_create_makes_one_bot_at_a_time(adapter_mod, monkeypatch, tmp_path):
+    compat, RequestError = adapter_mod.compat, adapter_mod.RequestError
+    monkeypatch.setattr(compat, "_hermes_cli", lambda: "hermes")
+    monkeypatch.setattr(compat, "agent_home", lambda runner, n: tmp_path / "profiles" / n)
+    monkeypatch.setattr(compat, "_creating", {"scribe"})
+    with pytest.raises(RequestError) as e:
+        asyncio.run(compat.agents_create(_Runner(), "painter", ""))
+    assert e.value.code == "unavailable" and "another bot" in str(e.value)
+    with pytest.raises(RequestError) as e:
+        asyncio.run(compat.agents_create(_Runner(), "scribe", ""))
+    assert e.value.code == "bad_request"
 
 
 def test_create_clones_main_and_turns_the_3ds_back_on(adapter_mod, monkeypatch, tmp_path):

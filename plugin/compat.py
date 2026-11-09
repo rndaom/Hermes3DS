@@ -123,10 +123,14 @@ def served_agents(runner) -> list[str]:
 
 
 def agent_home(runner, name: str) -> Path:
-    """A served profile's Hermes home: the gateway's own for the main agent, else `<root>/profiles/<name>`."""
-    from hermes_constants import get_process_hermes_home
-    root = Path(get_process_hermes_home())
-    return root if name == served_agents(runner)[0] else root / "profiles" / name
+    """A served profile's Hermes home: the gateway's own for the main agent, else the Hermes root for `default`
+    and `<root>/profiles/<name>` for the rest. (The root is not the gateway's home when the main agent is itself
+    a named profile: `hermes -p work gateway run`.)"""
+    from hermes_constants import get_default_hermes_root, get_process_hermes_home
+    if name == served_agents(runner)[0]:
+        return Path(get_process_hermes_home())
+    root = Path(get_default_hermes_root())
+    return root if name == "default" else root / "profiles" / name
 
 
 @contextlib.asynccontextmanager
@@ -151,11 +155,37 @@ async def profile_scope(home: Path | None):
         reset_hermes_home_override(home_token)
 
 
-def _yaml(path: Path) -> dict:
+@functools.lru_cache(maxsize=1)
+def _yaml_loader():
+    """Hermes's own YAML reader (`hermes_yaml`, in every Hermes this plugin supports). PyYAML is only a fallback
+    for running outside Hermes (the tests): Hermes does not ship it. None, said once in the log, if neither is
+    there, so a bot roster without titles or pictures is never a silent mystery."""
     try:
-        import yaml
-        data = yaml.safe_load(path.read_text(encoding="utf-8"))
-    except Exception:
+        from hermes_yaml import safe_load
+        return safe_load
+    except ImportError:
+        pass
+    try:
+        from yaml import safe_load
+        return safe_load
+    except ImportError:
+        log.warning("3ds: no YAML reader (hermes_yaml or PyYAML): bots show without their titles, "
+                    "descriptions, models and pictures")
+        return None
+
+
+def _yaml(path: Path) -> dict:
+    load = _yaml_loader()
+    if load is None:
+        return {}
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return {}  # a profile without this file is ordinary
+    try:
+        data = load(text)
+    except Exception as exc:  # a broken file: say which, keep the roster working
+        log.warning("3ds: could not read %s: %s", path, exc)
         return {}
     return data if isinstance(data, dict) else {}
 
@@ -223,6 +253,8 @@ async def agents_create(runner, name: str, desc: str) -> dict[str, Any]:
         raise RequestError("bad_request", f"there is already a profile called {name}")
     if name in _creating:
         raise RequestError("bad_request", f"{name} is already being made")
+    if _creating:  # one at a time: each is a `hermes` process of up to minutes on the gateway's shared threads
+        raise RequestError("unavailable", "another bot is being made: try again in a moment")
     cli = _hermes_cli()
     if cli is None:
         raise RequestError("unavailable", "the hermes command was not found on the PC")
