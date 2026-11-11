@@ -87,9 +87,12 @@ Tailscale Funnel ([away from home](#away-from-home)). Either way the connection 
 ### 1. The plugin (on the computer that runs Hermes)
 
 ```bash
-hermes plugins install rndaom/Hermes3DS#plugin
+hermes plugins install 3ds-platform
 hermes plugins enable 3ds-platform
 ```
+
+The plugin is in the Hermes plugin catalog. If your Hermes doesn't list it yet, update Hermes, or install straight
+from this repository with `hermes plugins install rndaom/Hermes3DS#plugin`.
 
 Turn the platform on in Hermes' `config.yaml` (and turn on streaming, which Hermes leaves off by default):
 
@@ -224,7 +227,7 @@ Details: [docs/away-from-home.md](docs/away-from-home.md).
 - **A message shows "NOT SENT":** the connection dropped before the computer got it. Send it again once the
   status bar shows the link.
 - **Replies arrive all at once instead of streaming:** turn on `streaming.enabled` (see Install).
-- **No sound:** dump the DSP firmware (see *What you need*).
+- **No sound:** the app couldn't copy the DSP firmware by itself; dump it once (see *What you need*).
 - **Audio files arrive as plain files, no spoken replies:** install `ffmpeg` on the computer; for spoken
   replies, text-to-speech must work in Hermes too.
 - **Voice messages arrive but nothing is heard:** speech-to-text isn't set up in Hermes (`hermes tools`).
