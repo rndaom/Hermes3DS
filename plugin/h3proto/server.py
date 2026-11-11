@@ -33,6 +33,7 @@ CALLBACK_TIMEOUT = 5.0
 CALLBACK_MIN_INTERVAL = 1.0  # per source address
 CALLBACK_MAX_PENDING = 4
 AWAY_MAX_HANDSHAKES = 16  # unauthenticated handshakes in flight on the internet-facing away listener
+LAN_MAX_HANDSHAKES = 64  # the same for the home listener: idle sockets must not use up the gateway's file handles
 _UNKNOWN = object()  # away address not known yet (Tailscale setup still running)
 
 
@@ -123,7 +124,10 @@ class Hermes3DSServer:
         self._away_tcp: asyncio.base_events.Server | None = None
         # Away handshakes in flight, oldest first. When full, the oldest is dropped rather than the newcomer: idle
         # sockets (every funnel peer looks like 127.0.0.1) can then delay the real 3DS but not lock it out.
+        # A handshake leaves the count as soon as its hello arrives (on the away listener: decrypts, which takes
+        # the server's key, known only at home), so a flood of sockets cannot keep pushing a real 3DS out.
         self._away_pending: "OrderedDict[asyncio.Task, None]" = OrderedDict()
+        self._lan_pending: "OrderedDict[asyncio.Task, None]" = OrderedDict()
         self._away: Any = _UNKNOWN  # {"host","port"}, None (no away route) or _UNKNOWN
         self._udp: asyncio.DatagramTransport | None = None
         self._conn_tasks: set[asyncio.Task] = set()
@@ -135,7 +139,7 @@ class Hermes3DSServer:
 
     async def start(self) -> None:
         """Bind listeners. Raises OSError (e.g. port in use) for the caller to report."""
-        self._tcp = await asyncio.start_server(self._on_connection, self.cfg.host, self.cfg.port)
+        self._tcp = await asyncio.start_server(self._on_lan_connection, self.cfg.host, self.cfg.port)
         if self.cfg.away_port:
             try:
                 self._away_tcp = await asyncio.start_server(self._on_away_connection, self.cfg.away_host,
@@ -248,10 +252,17 @@ class Hermes3DSServer:
         while len(self._away_pending) >= AWAY_MAX_HANDSHAKES:  # the internet can reach this one: bound the work
             oldest, _ = self._away_pending.popitem(last=False)
             oldest.cancel()
-        await self._on_connection(reader, writer, away=True)
+        await self._on_connection(reader, writer, away=True, pending=self._away_pending)
+
+    async def _on_lan_connection(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        while len(self._lan_pending) >= LAN_MAX_HANDSHAKES:
+            oldest, _ = self._lan_pending.popitem(last=False)
+            oldest.cancel()
+        await self._on_connection(reader, writer, pending=self._lan_pending)
 
     async def _on_connection(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, *,
-                             away: bool = False) -> None:
+                             away: bool = False,
+                             pending: "OrderedDict[asyncio.Task, None] | None" = None) -> None:
         task = asyncio.current_task()
         self._conn_tasks.add(task)
         peer = writer.get_extra_info("peername")
@@ -261,6 +272,8 @@ class Hermes3DSServer:
             authed: dict[str, Any] = {}
 
             async def on_hello(hello: dict, remote_static: bytes | None) -> dict:
+                if pending is not None and (remote_static is not None or not away):
+                    pending.pop(task, None)  # it spoke: no longer an idle socket holding a slot
                 reply = await self._authorize(hello, remote_static, peer, away=away)
                 if reply["t"] == "welcome":
                     authed["device"] = self.devices.get(remote_static) if remote_static else \
@@ -270,16 +283,16 @@ class Hermes3DSServer:
                         reply = downgrade_message(reply)
                 return reply
 
-            if away:
-                self._away_pending[task] = None
+            if pending is not None:
+                pending[task] = None
             try:
                 channel, hello, reply = await asyncio.wait_for(
                     server_handshake(reader, writer, static=self.static if self.cfg.secure else None,
                                      on_hello=on_hello),
                     AWAY_HANDSHAKE_TIMEOUT if away else HANDSHAKE_TIMEOUT)
             finally:
-                if away:
-                    self._away_pending.pop(task, None)
+                if pending is not None:
+                    pending.pop(task, None)
             if reply["t"] != "welcome":
                 return
             device = authed["device"]

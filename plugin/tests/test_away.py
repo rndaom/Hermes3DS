@@ -13,7 +13,8 @@ from h3proto.away import (AwayManager, DISABLED_FILE, ENABLED_FILE, effective_mo
 from h3proto.client import Client, ServerError
 from h3proto.noise import KeyPair
 from h3proto.pairing import DeviceStore, TokenStore
-from h3proto.server import AWAY_MAX_HANDSHAKES, Hermes3DSServer, ServerConfig, is_lan_peer
+from h3proto.server import (AWAY_MAX_HANDSHAKES, LAN_MAX_HANDSHAKES, Hermes3DSServer, ServerConfig,
+                             is_lan_peer)
 
 DNS = "my-pc.tail1234.ts.net"
 
@@ -147,6 +148,58 @@ async def test_away_listener_bounds_pending_handshakes_dropping_the_oldest(away_
     await asyncio.sleep(0.05)
     assert len(srv._away_pending) == AWAY_MAX_HANDSHAKES and not r.at_eof()
     w.close()
+    for w in socks:
+        w.close()
+
+
+async def test_home_listener_bounds_pending_handshakes_dropping_the_oldest(server):
+    srv = server
+    socks, readers = [], []
+    for _ in range(LAN_MAX_HANDSHAKES):
+        r, w = await asyncio.open_connection("127.0.0.1", srv.port)
+        socks.append(w)
+        readers.append(r)
+    for _ in range(50):
+        if len(srv._lan_pending) >= LAN_MAX_HANDSHAKES:
+            break
+        await asyncio.sleep(0.02)
+    r, w = await asyncio.open_connection("127.0.0.1", srv.port)
+    assert await asyncio.wait_for(readers[0].read(), 2) == b""
+    await asyncio.sleep(0.05)
+    assert len(srv._lan_pending) == LAN_MAX_HANDSHAKES and not r.at_eof()
+    # A real 3DS still gets in while the idle sockets sit there.
+    c, _ = await _pair(srv)
+    assert c.welcome["server"] == "PC"
+    await c.close()
+    w.close()
+    for w in socks:
+        w.close()
+
+
+async def test_away_handshake_that_spoke_cannot_be_pushed_out_by_idle_sockets(away_server):
+    srv = away_server
+    c, key = await _pair(srv)
+    await c.close()
+    gate = asyncio.Event()
+
+    async def slow_welcome_state(device):
+        await gate.wait()
+        return {}
+
+    srv.backend.welcome_state = slow_welcome_state
+    connecting = asyncio.ensure_future(
+        Client.connect("127.0.0.1", srv.away_port, static=key, server_key=srv.static.public))
+    await asyncio.sleep(0.2)  # its hello has decrypted; it now waits for the welcome
+    assert not srv._away_pending
+    socks = []
+    for _ in range(AWAY_MAX_HANDSHAKES + 4):  # a flood of idle sockets comes and goes meanwhile
+        _, w = await asyncio.open_connection("127.0.0.1", srv.away_port)
+        socks.append(w)
+    await asyncio.sleep(0.1)
+    gate.set()
+    c2 = await asyncio.wait_for(connecting, 2)
+    assert c2.welcome["server"] == "PC"
+    await c2.close()
     for w in socks:
         w.close()
 

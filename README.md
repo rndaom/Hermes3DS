@@ -40,6 +40,7 @@ stream onto the top screen as they're written; you answer with the keyboard, you
 </details>
 
 These are real screens from the app, captured in an emulator with a scripted test server standing in for Hermes.
+They were taken before 0.2.0, which added the **Bots** tab between Chat and Sessions.
 
 ## What it does
 

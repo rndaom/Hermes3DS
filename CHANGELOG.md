@@ -12,6 +12,14 @@ Plugin.
 - On Hermes 0.22, with two approval cards showing, the newer card waits for the older one instead of answering it.
 - Markdown files are sent as `text/markdown` on Python 3.11 and 3.12 too.
 - A server key that cannot be loaded no longer leaves the port's lock held.
+- Idle connections can no longer pile up on the home port (at most 64 wait to say hello; the oldest makes way), and
+  a flood of them on the away port can no longer push out a 3DS that has already said hello.
+
+App.
+
+- Save to SD: a file whose name starts with a dot is saved under a cleaned name like every other file (its
+  slashes were kept before, so the name could point outside the files folder).
+- A text with more tables than the layout can count is laid out as records instead of crashing.
 
 ## 0.2.0 (2026-11-06)
 

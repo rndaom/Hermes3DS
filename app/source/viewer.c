@@ -241,7 +241,11 @@ static void save_path(const char *name, char *out, size_t cap)
     for (const char *p = name; *p && n + 1 < sizeof clean; p++)
         clean[n++] = strchr("/\\:*?\"<>|", *p) || (unsigned char)*p < 32 ? '_' : *p;
     clean[n] = 0;
-    if (!n || clean[0] == '.') snprintf(clean, sizeof clean, "file%s", n ? name : "");
+    if (!n || clean[0] == '.') {  // no name, or a dot file: "file", "file.txt" (from the cleaned copy, never the raw name)
+        char t[sizeof clean];
+        snprintf(t, sizeof t, "file%s", clean);
+        memcpy(clean, t, sizeof clean);
+    }
     const char *dot = strrchr(clean, '.');
     int stem = dot && dot != clean ? (int)(dot - clean) : (int)strlen(clean);
     struct stat st;

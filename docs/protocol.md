@@ -150,7 +150,9 @@ Outside the home network the 3DS reaches the PC through **Tailscale Funnel**, wh
   It rechecks every 10 minutes (every minute while Tailscale isn't running or signed in).
 - The away listener binds loopback only, so every connection on it came through the funnel (tailscaled dials
   `127.0.0.1`). No PROXY protocol is needed to tell funnel traffic apart. It never accepts pairing (§2.2) or
-  plaintext mode, and it caps unauthenticated handshakes in flight at 16 (a new one drops the oldest).
+  plaintext mode, and it caps handshakes that have not yet sent a valid message 1 at 16 (a new one drops the
+  oldest; one whose message 1 decrypted no longer counts, so idle sockets cannot push it out). The home listener
+  caps handshakes that have not yet said hello at 64 in the same way.
 - TLS only gets the stream through the funnel. The client does not verify the certificate: Noise IK
   authenticates the PC by the key pinned at pairing, end to end, so a TLS man in the middle sees only Noise
   ciphertext. The 3DS (mbedTLS 2.28) offers ECDHE with X25519/P-256 and ChaCha20-Poly1305 first, then AES-GCM,

@@ -339,11 +339,14 @@ static void layout_table(TextLayout *tl, const char *text, uint32_t a, uint32_t 
     float gap = floorf(finf->lineFeed * base * 0.8f + 0.5f), total = -gap;
     for (int k = 0; k < ncols; k++) total += colw[k] + gap;
 
-    if (total <= max_w) {  // grid
-        if (tl->ntables == tl->tcap) {
-            tl->tcap = tl->tcap ? tl->tcap * 2 : 2;
-            tl->tables = realloc(tl->tables, (size_t)tl->tcap * sizeof(TableCols));
-        }
+    bool grid = total <= max_w && tl->ntables < INT16_MAX;  // a Line holds its table's index in 16 bits
+    if (grid && tl->ntables == tl->tcap) {
+        int cap = tl->tcap ? tl->tcap * 2 : 2;
+        TableCols *t = realloc(tl->tables, (size_t)cap * sizeof(TableCols));
+        if (t) tl->tables = t, tl->tcap = cap;
+        else grid = false;  // out of memory: lay it out as records instead
+    }
+    if (grid) {
         TableCols *tc = &tl->tables[tl->ntables];
         tc->ncols = ncols;
         for (int k = 0, x = 0; k < ncols; x += (int)(colw[k] + gap), k++) tc->col_x[k] = (float)x;
