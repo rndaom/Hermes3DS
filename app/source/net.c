@@ -718,9 +718,10 @@ void net_exit(void)
     push_cmd(new_cmd(CMD_QUIT));
     // No overall timeout: threadFree on a running thread is a no-op, and the worker must be gone before socExit.
     // Only a DNS lookup can still hold it for a while. Free the events it queues meanwhile so it never waits on
-    // a full queue the UI no longer reads.
+    // a full queue the UI no longer reads. A join that timed out returns 0x09401BFE, which is not R_FAILED: only
+    // 0 means the worker has ended.
     NetEvent *ev;
-    while (R_FAILED(threadJoin(thread, 100 * 1000000ULL)))
+    while (threadJoin(thread, 100 * 1000000ULL) != 0)
         while ((ev = queue_pop(&events))) net_event_free(ev);
     threadFree(thread);
     thread = NULL;

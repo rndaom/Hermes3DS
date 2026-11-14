@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.2.1 (2026-11-14)
+
+App and plugin (0.2.1): fixes only. Either end still works with the other's 0.2.0.
 
 Plugin.
 
@@ -20,6 +22,8 @@ App.
 - Save to SD: a file whose name starts with a dot is saved under a cleaned name like every other file (its
   slashes were kept before, so the name could point outside the files folder).
 - A text with more tables than the layout can count is laid out as records instead of crashing.
+- Closing the app waits for its network worker to finish (a wait that timed out was taken for finished, so the app
+  could go on closing while the worker still ran).
 
 ## 0.2.0 (2026-11-06)
 
