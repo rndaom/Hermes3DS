@@ -30,11 +30,12 @@ from .h3proto import avatar
 from .h3proto.blobs import BlobStore
 from .h3proto import fetch
 from .h3proto.media import (build_attachment, build_attachment_bytes, build_speech_attachment, clean_name,
-                            is_image_name)
+                            guess_mime, is_image_name)
 from .h3proto.pairing import Device, DeviceStore, TokenStore, load_or_create_key
 from .h3proto.emoji import emoji_for_3ds
 from .h3proto.richtext import markdown_to_rich, stream_to_rich
 from .h3proto.server import Hermes3DSServer, RequestError, ServerConfig
+from .h3proto.update import UpdateChecker
 
 logger = logging.getLogger("hermes3ds")
 
@@ -55,7 +56,7 @@ DOWNLOAD_MAX = fetch.MAX_BYTES
 # __init__. 40 bits; with the counter it stays inside the 3DS's 23-character speech ids.
 _RUN_TAG = secrets.token_hex(5)
 ATTACH_PER_MESSAGE = 8    # keeps the msg JSON far below the 64 KiB frame limit
-PHOTOS_PER_SEND = 4       # pictures one 3DS `send` may carry (protocol.md §4.4)
+PHOTOS_PER_SEND = 4       # photos or files one 3DS `send` may carry (protocol.md §4.4)
 HEARD_WAIT = 600.0        # seconds a voice message waits for Hermes' transcript echo
 # "Open on PC" hands the file to its default app, so only types that open in a viewer: pictures, sound, video
 # and documents without macros. A blocklist can't keep up with everything a desktop will run (.pif, .msc, .chm,
@@ -234,7 +235,9 @@ class ThreeDSAdapter(BasePlatformAdapter):
         self.away_public_port = int(_cfg(extra, "away_public_port", 0) or 0)
         self.away_address = parse_address(_cfg(extra, "away_address", ""))
         self.speech_groups = str(_cfg(extra, "speech_groups", "true")).strip().lower() not in ("0", "false", "no", "off")
+        self.update_check = str(_cfg(extra, "update_check", "true")).strip().lower() not in ("0", "false", "no", "off")
         self._away_task: Optional[asyncio.Task] = None
+        self._update_task: Optional[asyncio.Task] = None
         self._server: Optional[Hermes3DSServer] = None
         self._chat_keys: dict[str, bytes] = {}   # chat_id -> device key
         self._chat_names: dict[str, str] = {}
@@ -304,7 +307,8 @@ class ThreeDSAdapter(BasePlatformAdapter):
                          secure=self.secure, name=self.server_name,
                          away_port=0 if away_mode == "off" or not self.secure else self.away_port),
             _Backend(self), static, DeviceStore(data / "devices.json"), TokenStore(data / "pair_tokens.json"),
-            server_info={"hermes": _hermes_version()}, blobs=self._blobs)
+            server_info={"hermes": _hermes_version(), "jobs": {"edit": True}, "sessions": {"edit": True},
+                         "switch": {"skills": True, "tools": True}}, blobs=self._blobs)
         try:
             await server.start()
         except OSError as exc:
@@ -335,6 +339,9 @@ class ThreeDSAdapter(BasePlatformAdapter):
             self._away_task = asyncio.get_running_loop().create_task(away.run())
         else:  # paired 3DSes forget their away address; `hermes 3ds away` reports it off
             await AwayManager(server, data, mode="off").once()
+        if self.update_check:  # a newer release, told to each 3DS in its welcome (protocol.md §4.3)
+            checker = UpdateChecker(data, lambda v: server.server_info.__setitem__("update", {"latest": v}))
+            self._update_task = asyncio.get_running_loop().create_task(checker.run())
         return True
 
     async def disconnect(self) -> None:
@@ -358,6 +365,9 @@ class ThreeDSAdapter(BasePlatformAdapter):
         if self._away_task:
             self._away_task.cancel()
             self._away_task = None
+        if self._update_task:
+            self._update_task.cancel()
+            self._update_task = None
         if self._server:
             await self._server.stop()
             self._server = None
@@ -473,22 +483,37 @@ class ThreeDSAdapter(BasePlatformAdapter):
         await self._entry(agent).handle_message(event)
         return mid
 
-    async def inject_photos(self, device: Device, refs: list, text: str, agent: Optional[str] = None) -> str:
-        """Photos from the 3DS camera (protocol.md §4.4 `attach`) → Hermes' image cache → a PHOTO event (vision)."""
-        from gateway.platforms.base import cache_image_from_bytes_async
-        urls, types = [], []
+    async def inject_files(self, device: Device, refs: list, text: str, agent: Optional[str] = None) -> str:
+        """What a 3DS `send` attaches (protocol.md §4.4.1): camera photos, and files picked from the SD card.
+        JPEG and PNG go to Hermes' image cache; a message of only those is a PHOTO event (vision). Anything else
+        goes to the document cache under its own name, which makes the message a DOCUMENT event: Hermes tells the
+        model where the file is and puts short text files into the turn."""
+        from gateway.platforms.base import cache_document_from_bytes_async, cache_image_from_bytes_async
+        urls, types, photos = [], [], 0
         for ref in refs:
             path = self._upload(device, ref)
-            png = (self._blobs.meta(path.name) or {}).get("mime") == "image/png"
-            try:
-                data = await asyncio.to_thread(path.read_bytes)
-                urls.append(await cache_image_from_bytes_async(data, ".png" if png else ".jpg"))
-            except ValueError as exc:
-                raise RequestError("bad_request", f"not a picture: {exc}")
-            types.append("image/png" if png else "image/jpeg")
+            meta = self._blobs.meta(path.name) or {}
+            mime = str(meta.get("mime") or "").lower()
+            data = await asyncio.to_thread(path.read_bytes)
+            if mime in ("image/jpeg", "image/png"):
+                try:
+                    urls.append(await cache_image_from_bytes_async(data, ".png" if mime == "image/png" else ".jpg"))
+                except ValueError as exc:
+                    raise RequestError("bad_request", f"not a picture: {exc}")
+                photos += 1
+            else:
+                name = clean_name(meta.get("name"), "file")
+                try:
+                    urls.append(await cache_document_from_bytes_async(data, name))
+                except (OSError, ValueError) as exc:
+                    raise RequestError("bad_request", f"can't keep {name}: {exc}")
+                if mime in ("", "application/octet-stream"):
+                    mime = guess_mime(name)
+            types.append(mime)
         mid = self._mid("u")
-        self._trace("photos", chat_id=chat_id_for(device, agent), mid=mid, paths=urls, text=text)
-        event = MessageEvent(text=text, message_type=MessageType.PHOTO, source=self.source_for(device, agent),
+        self._trace("files", chat_id=chat_id_for(device, agent), mid=mid, paths=urls, types=types, text=text)
+        kind = MessageType.PHOTO if photos == len(urls) else MessageType.DOCUMENT
+        event = MessageEvent(text=text, message_type=kind, source=self.source_for(device, agent),
                              message_id=mid, timestamp=datetime.datetime.now(), media_urls=urls, media_types=types)
         await self._entry(agent).handle_message(event)
         return mid
@@ -1114,7 +1139,7 @@ class _Backend:
             if attach is not None:
                 if not isinstance(attach, list) or not attach or len(attach) > PHOTOS_PER_SEND:
                     raise RequestError("bad_request", f"attach must list 1 to {PHOTOS_PER_SEND} uploads")
-                return {"t": "send_r", "mid": await a.inject_photos(device, attach, text, agent)}
+                return {"t": "send_r", "mid": await a.inject_files(device, attach, text, agent)}
             if not text:
                 raise RequestError("bad_request", "empty message")
             return {"t": "send_r", "mid": await a.inject_text(device, text, agent)}
@@ -1160,19 +1185,39 @@ class _Backend:
             title = " ".join(str(msg.get("title") or "").split())[:80]
             await a.inject_text(device, f"/new {title}".strip(), agent)
             return {"t": "sessions.new_r"}
+        if t == "sessions.rename":
+            return {"t": "sessions.rename_r", **await compat.sessions_rename(runner, source, msg.get("sid"),
+                                                                             msg.get("title"))}
+        if t == "sessions.delete":
+            return {"t": "sessions.delete_r", **await compat.sessions_delete(runner, source, msg.get("sid"))}
         if t == "commands.list":
             return {"t": "commands.list_r", "items": await compat.commands_list()}
         if t == "models.list":
             key = (await compat.current_session(runner, source))["key"]
             return {"t": "models.list_r", **await compat.models_list(runner, key)}
         if t == "skills.list":
-            return {"t": "skills.list_r", "items": await compat.skills_list()}
+            return {"t": "skills.list_r", "items": await compat.skills_list(PLATFORM)}
+        if t == "skills.set":
+            return {"t": "skills.set_r", **await compat.skills_set(PLATFORM, msg.get("name"), msg.get("enabled"))}
         if t == "tools.list":
             return {"t": "tools.list_r", "items": await compat.tools_list(PLATFORM)}
+        if t == "tools.set":
+            return {"t": "tools.set_r", **await compat.tools_set(PLATFORM, msg.get("toolset"), msg.get("enabled"))}
         if t == "jobs.list":
             return {"t": "jobs.list_r", "items": await compat.jobs_list()}
         if t == "jobs.action":
             return {"t": "jobs.action_r", "job": await compat.jobs_action(str(msg.get("job")), str(msg.get("op")))}
+        if t == "jobs.create":
+            # Made in this chat, so its results come back here (the bot's chat for a bot's job).
+            origin = {"platform": PLATFORM, "chat_id": chat_id_for(device, agent), "user_id": device.fp,
+                      "user_name": device.name}
+            return {"t": "jobs.create_r", "job": await compat.jobs_create(origin, msg.get("schedule"),
+                                                                           msg.get("prompt"), msg.get("name"))}
+        if t == "jobs.update":
+            return {"t": "jobs.update_r", "job": await compat.jobs_update(
+                str(msg.get("job")), msg.get("name"), msg.get("schedule"), msg.get("prompt"))}
+        if t == "jobs.delete":
+            return {"t": "jobs.delete_r", "job": await compat.jobs_delete(str(msg.get("job")))}
         if "id" in msg:
             raise RequestError("bad_request", f"unknown request {t!r}")
         return None  # unknown events are ignored (forward compatibility)

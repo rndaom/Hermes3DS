@@ -1,5 +1,50 @@
 # Changelog
 
+## 0.3.0 (2026-11-15)
+
+App and plugin (0.3.0): send a file from the SD card, make, change and delete scheduled jobs, turn skills and tools
+on and off, rename and delete sessions, and a notice when a newer release is out. An older plugin does none of
+these, and the app says so (the update notice just never appears).
+
+- **Update notice:** about once a day the plugin asks GitHub for this project's newest release (one request to a
+  public page; it names no user, device or version) and tells the app, which says so once in the chat when it is
+  older. `hermes 3ds doctor` says when the plugin is older. It is a notice only: nothing is downloaded or
+  installed. `update_check: false` under `platforms.3ds` (or `THREEDS_UPDATE_CHECK=false`) turns it off.
+
+- **Rename and delete sessions** (Sessions tab): A on a session opens its options: resume (or open, for the one
+  you are in), rename, delete (asks first). A deleted session and its messages are removed from the computer for
+  good. The session you are in can be renamed but not deleted, and one Hermes is working in waits until it is
+  done. Only this 3DS's own sessions can be touched. Changed key: A used to resume at once; it is now A, then A.
+  With an older plugin A resumes at once as before.
+- **Skills and tools on and off** (Skills tab): X turns the selected skill off or on. Y, or the button beside the
+  list's title, shows the sets of tools Hermes can use (web, files, terminal, browser and more); A or X turns one
+  off or on. Both are for chats from a 3DS only: Telegram, Discord and the rest keep their own choice, and each
+  bot has its own. A tool set you turn off is gone from your next message; one you turn on, and any skill change,
+  starts with your next new chat. What is off for every platform stays the computer's to change (`hermes skills`,
+  `hermes tools`), and the skill Hermes needs for itself stays on. Changed key: Y used to refresh the skills list;
+  the list now refreshes when you switch between Skills and Tools.
+- **Jobs from the 3DS** (Jobs tab): X makes a job with two questions, what Hermes should do and when ("every day
+  at 9am", "every 2h", "in 30m"). Its results arrive in the chat you made it in. A on a job opens its actions:
+  run now, pause or resume, rename, change the schedule, change the prompt, delete (asks first). The top screen
+  shows the job's prompt. A prompt over 1000 characters can be read but not edited on the 3DS. Changed keys: A
+  used to run the job at once and X paused it; both are now in the job's actions. A one-time job that has run shows as finished: it can be run again, renamed
+  or deleted, but not paused or given a new time.
+- A notice too long for one line is no longer cut off: it wraps, and stays up longer.
+
+- **Send a file** (More → 3DS → Send a file): browse the SD card's folders, pick a file of up to 8 MB, add a note
+  or a question, and send. It appears in the chat as a file card with its upload progress. On the computer Hermes
+  gets it as a document: it is told where the file is, short text files are put into the turn, and pictures
+  (JPEG, PNG) are looked at like camera photos. The picker opens in the folder you used last.
+- The plugin's `welcome` says `upload.files`; a `send` may attach files of any type, not only photos.
+
+Plugin.
+
+- `hermes 3ds doctor` checks the computer's side of the setup and says what to fix, with the command for each:
+  the platform switch, the listener and discovery (asked on `127.0.0.1`), a different listener on the port, the
+  computer's addresses, the firewall command for this system, paired consoles, streaming, ffmpeg, speech-to-text,
+  each bot's plugin copy and switch, away mode, a container, `security: plaintext` and a key file others can
+  read. It only looks: nothing is changed, no key is made, no other program is run.
+
 ## 0.2.1 (2026-11-14)
 
 App and plugin (0.2.1): fixes only. Either end still works with the other's 0.2.0.

@@ -1,6 +1,6 @@
 """Hermes 3DS — Nintendo 3DS platform plugin for Hermes Agent.
 
-Registers the `3ds` gateway platform and the `hermes 3ds pair|devices|unpair` CLI.
+Registers the `3ds` gateway platform and the `hermes 3ds pair|devices|unpair|away|doctor` CLI.
 """
 
 from __future__ import annotations

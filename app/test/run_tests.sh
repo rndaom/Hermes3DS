@@ -71,3 +71,13 @@ if command -v ffmpeg >/dev/null 2>&1; then
 else
     echo "adpcm: skipped (no ffmpeg)"
 fi
+
+# The SD card file picker's ordering, paths and file types (plain C).
+OUT="$TMP/h3ds_test_filelist.exe"
+"$CC" -std=c99 -O2 -Wall -Wextra -Werror -D_CRT_SECURE_NO_WARNINGS test_filelist.c ../source/filelist.c -o "$OUT"
+"$OUT"
+
+# The update notice's version comparing (plain C).
+OUT="$TMP/h3ds_test_version.exe"
+"$CC" -std=c99 -O2 -Wall -Wextra -Werror -D_CRT_SECURE_NO_WARNINGS test_version.c ../source/version.c -o "$OUT"
+"$OUT"

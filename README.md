@@ -50,16 +50,21 @@ They were taken before 0.2.0, which added the **Bots** tab between Chat and Sess
 - **Bots:** chat with each of your Hermes profiles (the bots of Hermes Bot Mode) from the **Bots** tab, each in
   its own chat with its own sessions, skills, jobs and model; make a new one from the 3DS. Needs
   `gateway.multiplex_profiles: true` (see [Bots](#bots)).
-- **Sessions, skills, jobs, models:** browse and resume sessions, see skills and scheduled jobs, switch model,
-  run slash commands from a grid.
+- **Sessions, skills, jobs, models:** browse, resume, rename and delete sessions, see skills, switch model, run slash
+  commands from a grid. Turn skills and sets of tools (web, files, terminal and more) on or off for chats from
+  the 3DS, without touching your other chat apps. Make scheduled jobs on the 3DS ("every day at 9am"), run, pause, change or delete them;
+  their results arrive in the chat.
 - **Files:** pictures, documents (text, Markdown, code, PDF, Office), and audio sent by Hermes open in a
   viewer, a reader or a player. Save to SD, or open the original on your computer.
 - **Voice and camera:** hold Y to send a voice message (Hermes transcribes it), take a photo for Hermes to look
   at, and have replies read aloud.
+- **Files from the SD card:** More → 3DS → Send a file. Pick a file (up to 8 MB), add a note if you like, and
+  Hermes gets it on the computer: it reads text and documents, and looks at pictures.
 - **At home and away:** finds your computer on the Wi-Fi by itself; with Tailscale it also works over the
   internet (a phone hotspot, a friend's Wi-Fi).
 - **Encrypted:** everything between the 3DS and your computer is end-to-end encrypted (Noise IK), and only a
   3DS you paired can connect.
+- **Update notice:** when a newer release is out, the app tells you in the chat.
 
 ## How it works
 
@@ -109,6 +114,10 @@ Then restart the gateway: `hermes gateway restart`.
 
 The plugin listens on **TCP 7333** (the 3DS connects here) and **UDP 7334** (so the 3DS can find the
 computer). If your firewall blocks them, allow both from your home network.
+
+To check the computer's side at any time, run `hermes 3ds doctor`. It looks at the config, the listener, the
+network, pairing, streaming, ffmpeg, bots and away mode, and prints what to fix, with the command for each. It
+only looks: it changes nothing.
 
 ### 2. The app (on the 3DS)
 
@@ -208,6 +217,9 @@ Details: [docs/away-from-home.md](docs/away-from-home.md).
 
 ## Troubleshooting
 
+Start with `hermes 3ds doctor` on the computer: it checks the setup below and names the fix for whatever is
+wrong.
+
 - **The 3DS can't find the computer / "PC not reachable":** first check the gateway is running with the
   plugin on: `hermes plugins list` shows `3ds-platform` enabled, `hermes gateway status` says running, and
   `~/.hermes/logs/gateway.log` has the line `3DS: listening on 0.0.0.0:7333 (secure)`. Both devices must be on
@@ -245,6 +257,8 @@ Details: [docs/away-from-home.md](docs/away-from-home.md).
   touches Tailscale.
 - Runs `tailscale`, `ffmpeg` (audio for the 3DS) and your desktop's file opener (for **Open on PC**).
 - Downloads images linked in replies to shrink them for the 3DS.
+- Asks GitHub about once a day whether a newer Hermes 3DS is out, so the 3DS and `hermes 3ds doctor` can tell
+  you. It installs nothing; `update_check: false` under `platforms.3ds` turns it off.
 - Keeps its key and the paired consoles in Hermes' plugin data folder. No telemetry.
 
 The full list is in [plugin/README.md](plugin/README.md#what-it-does-on-your-computer).
@@ -275,7 +289,8 @@ stock logo). Host tests:
 **Plugin tests:** `pip install -r plugin/requirements-dev.txt`, then `python -m pytest` in `plugin/`.
 
 **Tools:** `tools/fake3ds.py` (a 3DS client for the terminal), `tools/mock_pc.py` (a scripted server for testing
-the app without a model), `tools/hermes_integration.py` (adapter checks inside a Hermes environment).
+the app without a model), `tools/hermes_integration.py` (adapter checks inside a Hermes environment),
+`tools/hermes_compat.py` (does the plugin still fit the newest Hermes release and its main branch).
 
 The wire protocol is documented in [docs/protocol.md](docs/protocol.md).
 

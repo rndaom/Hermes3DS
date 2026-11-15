@@ -365,7 +365,7 @@ class Hermes3DSServer:
         info.update(self.server_info)
         info.update(self._away_fields())
         if self.blobs is not None:
-            info["upload"] = {"max": UPLOAD_MAX}
+            info["upload"] = {"max": UPLOAD_MAX, "files": True}
         info["chat"] = await self.backend.welcome_state(device)
         return info
 

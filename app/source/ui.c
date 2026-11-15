@@ -432,6 +432,14 @@ void draw_toast(void)
     if (app.toast_until <= osGetTime()) return;
     float w = text_width(app.toast, strlen(app.toast), S_SMALL) + 16;
     float x = (BOT_W - w) / 2, y = SCR_H - 8 - 15 - 6 - 20;
-    rect(x, y, w, 18, COL_INK);
-    text_draw(app.toast, x + 8, y + 3, S_SMALL, COL_ON);
+    if (w <= BOT_W - 12) {
+        rect(x, y, w, 18, COL_INK);
+        text_draw(app.toast, x + 8, y + 3, S_SMALL, COL_ON);
+        return;
+    }
+    // Too long for one line (an error in Hermes' own words): a box of up to four lines, its foot where the
+    // one-line toast's is.
+    float bw = BOT_W - 12, h = text_block(app.toast, 0, 0, bw - 16, S_SMALL, NULL, 4, NULL);
+    rect(6, y + 18 - h - 6, bw, h + 6, COL_INK);
+    text_block(app.toast, 14, y + 18 - h - 3, bw - 16, S_SMALL, &USER_COLORS, 4, NULL);
 }

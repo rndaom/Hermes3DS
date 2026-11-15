@@ -10,6 +10,9 @@
 
 void tabs_switch(Tab t);  // also used to return to Chat
 void tabs_online(void);   // connected again: lists are stale
+void tabs_set_jobs_edit(bool yes);  // the PC can make, change and delete jobs (welcome `jobs.edit`)
+void tabs_set_sessions_edit(bool yes);  // the PC can rename and delete sessions (welcome `sessions.edit`)
+void tabs_set_switch(bool skills, bool tools);  // the PC can turn skills / tools on and off (welcome `switch`)
 void tabs_agent_changed(void);  // another agent was selected: its own sessions, skills, jobs and models
 // A reply to one of the tabs' requests. Returns true when it was consumed (status_r is only copied).
 bool tabs_handle(json_t *msg);

@@ -8,6 +8,7 @@ import sys
 import time
 import types
 import wave
+from pathlib import Path
 
 import pytest
 
@@ -122,7 +123,7 @@ async def _paired(srv):
 
 async def test_upload_over_the_wire_resumes_after_reconnect(server):
     c, key = await _paired(server)
-    assert c.welcome["upload"] == {"max": UPLOAD_MAX}
+    assert c.welcome["upload"] == {"max": UPLOAD_MAX, "files": True}
     data = bytes((i * 7) & 255 for i in range(100_000))
     assert await c.put_blob("uvoice1", data, "audio/x-ima-adpcm", stop_at=40_000, chunk=10_000) == 40_000
     await asyncio.sleep(0.2)  # let the server store the pieces before the connection goes
@@ -263,8 +264,16 @@ def ad(adapter_mod, tmp_path, monkeypatch):  # noqa: F811
 
     monkeypatch.setattr(base, "cache_audio_from_bytes_async", cache_bytes, raising=False)
     monkeypatch.setattr(base, "cache_image_from_bytes_async", cache_bytes, raising=False)
+
+    async def cache_doc(data, filename):
+        path = tmp_path / f"doc_{len(list(tmp_path.iterdir()))}_{filename}"
+        path.write_bytes(data)
+        return str(path)
+
+    monkeypatch.setattr(base, "cache_document_from_bytes_async", cache_doc, raising=False)
     monkeypatch.setattr(adapter_mod, "MessageEvent", _Event)
-    monkeypatch.setattr(adapter_mod, "MessageType", types.SimpleNamespace(TEXT="text", VOICE="voice", PHOTO="photo"))
+    monkeypatch.setattr(adapter_mod, "MessageType", types.SimpleNamespace(TEXT="text", VOICE="voice", PHOTO="photo",
+                                                                         DOCUMENT="document"))
     a = adapter_mod.ThreeDSAdapter.__new__(adapter_mod.ThreeDSAdapter)
     a._blobs = BlobStore(tmp_path / "blobs")
     a._server = _UploadServer(a._blobs)
@@ -347,6 +356,41 @@ def test_photo_send_becomes_a_photo_event(ad, adapter_mod):
     for bad in ([], [{"blob": "up1"}] * 5, "up1"):
         with pytest.raises(adapter_mod.RequestError):
             asyncio.run(backend.handle(_device(), {"t": "send", "id": 7, "attach": bad}))
+
+
+def _upload_named(store, bid, data, mime, name):
+    store.begin_upload(bid, len(data), mime, name, "fp1")
+    store.write_upload(bid, 0, data, "fp1")
+
+
+def test_a_file_from_the_sd_card_becomes_a_document_event(ad, adapter_mod):
+    _upload_named(ad._blobs, "uf1", b"line one\nline two\n", "text/plain", "notes.txt")
+    _upload_named(ad._blobs, "uf2", b"%PDF-1.4 ...", "application/octet-stream", "sdmc:/docs/Report.pdf")
+    backend = adapter_mod._Backend(ad)
+    reply = asyncio.run(backend.handle(_device(), {"t": "send", "id": 8, "text": "sum these up",
+                                                   "attach": [{"blob": "uf1"}, {"blob": "uf2"}]}))
+    assert reply["t"] == "send_r"
+    (ev,) = ad.handled
+    assert ev.message_type == "document" and ev.text == "sum these up"
+    assert ev.media_types == ["text/plain", "application/pdf"]  # the second one guessed from its name
+    assert [Path(u).name.split("_", 2)[2] for u in ev.media_urls] == ["notes.txt", "Report.pdf"]
+    assert open(ev.media_urls[0], "rb").read() == b"line one\nline two\n"
+
+
+def test_a_photo_and_a_file_together_are_a_document_event(ad, adapter_mod):
+    _upload(ad._blobs, "up3", png_bytes((40, 30)), "image/png")
+    _upload_named(ad._blobs, "uf3", b"a,b\n1,2\n", "text/csv", "table.csv")
+    backend = adapter_mod._Backend(ad)
+    asyncio.run(backend.handle(_device(), {"t": "send", "id": 9, "attach": [{"blob": "up3"}, {"blob": "uf3"}]}))
+    (ev,) = ad.handled
+    assert ev.message_type == "document" and ev.media_types == ["image/png", "text/csv"]
+
+
+def test_an_upload_keeps_its_extension_when_the_name_is_cut(tmp_path):
+    from h3proto.blobs import _short_name
+    assert _short_name("a" * 200 + ".pdf") == "a" * 116 + ".pdf"
+    assert _short_name("short.txt") == "short.txt"
+    assert len(_short_name("x" * 300)) == 120
 
 
 def test_welcome_says_whether_hermes_speaks_in_this_chat(ad):

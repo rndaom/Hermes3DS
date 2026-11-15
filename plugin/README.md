@@ -33,7 +33,9 @@ streaming:
 
 Restart the gateway (`hermes gateway restart`), then pair the console once, at home: run `hermes 3ds pair`,
 open Hermes on the 3DS, pick your computer and type the code it shows. `hermes 3ds devices` lists paired
-consoles and `hermes 3ds unpair <name>` removes one.
+consoles and `hermes 3ds unpair <name>` removes one. `hermes 3ds doctor` checks the setup (config, listener,
+network, pairing, streaming, ffmpeg, bots, away mode) and prints what to fix; it only reads, plus one
+connection and one discovery question to `127.0.0.1`.
 
 ## Settings
 
@@ -45,6 +47,7 @@ All optional. Set them under `platforms.3ds` in `config.yaml` or as environment 
 | (variable only) | `THREEDS_HOME_CHANNEL` | none | Chat id (`dev:<fingerprint>`, see `hermes 3ds devices`) for cron delivery |
 | `away` | `THREEDS_AWAY` | off | Away-from-home access through Tailscale Funnel: `on`, `auto` (no warning when Tailscale is missing) or `off`; unset means off unless `hermes 3ds away on` was run (see below) |
 | `away_port` | `THREEDS_AWAY_PORT` | `7339` | Loopback port the Funnel forwards to |
+| `update_check` | `THREEDS_UPDATE_CHECK` | `true` | Ask GitHub once a day whether a newer Hermes 3DS is out; `false` turns it off |
 
 Bots: with `gateway.multiplex_profiles: true` (a Hermes setting, in the main profile's `config.yaml`) the 3DS
 lists every Hermes profile the gateway serves and chats with each one separately; without it the 3DS sees only the
@@ -80,6 +83,10 @@ Read this before installing.
   keys and skills) followed by `hermes -p <name> config set platforms.3ds.enabled true`.
 - **Downloads pictures.** When a reply contains an image link, the plugin downloads that image to shrink it for
   the 3DS screen.
+- **Checks for a newer release, about once a day.** One request to GitHub's public API for this project's latest
+  release. It sends nothing about you, the computer or the 3DS, and it downloads and installs nothing: the 3DS
+  only says that a newer version is out, and `hermes 3ds doctor` says the same for the plugin.
+  `update_check: false` under `platforms.3ds` turns it off.
 - **Stores keys.** Its own data folder (Hermes' plugin data directory for `3ds`) holds the computer's long-term
   key (`server_key`, readable by your user only) and the list of paired consoles (`devices.json`). Outside
   that folder it reads only Hermes' own config and state (sessions, skills, jobs, models, and each profile's

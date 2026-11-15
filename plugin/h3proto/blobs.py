@@ -46,6 +46,14 @@ def new_id() -> str:
     return "b" + base64.b32encode(secrets.token_bytes(10)).decode("ascii").lower()
 
 
+def _short_name(name: str, limit: int = 120) -> str:
+    """`name` cut to `limit` characters, keeping its extension (the PC tells file types by it)."""
+    if len(name) <= limit:
+        return name
+    stem, dot, ext = name.rpartition(".")
+    return name[:limit] if not dot or len(ext) > 10 else stem[:limit - len(ext) - 1] + "." + ext
+
+
 class BlobStore:
     def __init__(self, root: Path, ttl: float = BLOB_TTL):
         self.root = Path(root)
@@ -148,7 +156,7 @@ class BlobStore:
                     return have
             (self.root / (bid + ".part")).unlink(missing_ok=True)
         mime = str(mime or "application/octet-stream")[:100]
-        meta = {"mime": mime, "name": str(name or "")[:120], "size": size, "created": now, "role": "upload",
+        meta = {"mime": mime, "name": _short_name(str(name or "")), "size": size, "created": now, "role": "upload",
                 "owner": owner, "partial": True}
         (self.root / (bid + ".part")).write_bytes(b"")
         self._write_meta(bid, meta)

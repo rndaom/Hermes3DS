@@ -10,6 +10,7 @@
 #include "blob.h"
 #include "camera.h"
 #include "codec.h"
+#include "filepick.h"
 #include "image.h"
 #include "tabs.h"
 #include "text.h"
@@ -932,10 +933,12 @@ void draw_frame(C3D_RenderTarget *top, C3D_RenderTarget *bottom)
     C2D_SceneBegin(top);
     bool tab = app.screen == SCR_CHAT && app.tab != TAB_CHAT;
     bool files = app.screen == SCR_CHAT && viewer_is_open();
+    bool pick = app.screen == SCR_CHAT && filepick_is_open();
     bool cam = app.screen == SCR_CHAT && camera_is_open(), rec = app.screen == SCR_CHAT && voice_recording();
     if (app.screen == SCR_PAIR) draw_pair_top();
     else if (rec) voice_draw_top();
     else if (cam) camera_draw_top();
+    else if (pick) filepick_draw_top();
     else if (files) viewer_draw_top();
     else if (tab) tabs_draw_top();
     else draw_chat_top();
@@ -944,6 +947,7 @@ void draw_frame(C3D_RenderTarget *top, C3D_RenderTarget *bottom)
     if (app.screen == SCR_PAIR) draw_pair_bottom();
     else if (rec) voice_draw_bottom();
     else if (cam) camera_draw_bottom();
+    else if (pick) filepick_draw_bottom();
     else if (files) viewer_draw_bottom();
     else if (tab) tabs_draw_bottom();
     else draw_chat_bottom();

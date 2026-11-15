@@ -1,4 +1,4 @@
-"""`hermes 3ds pair | devices | unpair <name>` — runs outside the gateway, shares files with it."""
+"""`hermes 3ds pair | devices | unpair <name> | away | doctor` — runs outside the gateway, shares files with it."""
 
 from __future__ import annotations
 
@@ -17,6 +17,7 @@ def setup_cli(parser) -> None:
     unpair.add_argument("device", help="Device name or fingerprint")
     away = sub.add_parser("away", help="Away-from-home access through Tailscale Funnel: status, on, off")
     away.add_argument("action", nargs="?", choices=("status", "on", "off"), default="status")
+    sub.add_parser("doctor", help="Check this computer's side of the setup and say what to fix")
 
 
 def lan_addresses() -> list[str]:
@@ -185,5 +186,8 @@ def handle_cli(args) -> int:
         return 0 if ok else 1
     if cmd == "away":
         return _away(getattr(args, "action", "status") or "status", data)
-    print("usage: hermes 3ds {pair,devices,unpair,away}")
+    if cmd == "doctor":
+        from . import doctor
+        return doctor.run(data)
+    print("usage: hermes 3ds {pair,devices,unpair,away,doctor}")
     return 2

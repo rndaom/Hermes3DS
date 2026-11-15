@@ -10,6 +10,7 @@
 
 #include "codec.h"
 #include "camera.h"
+#include "filepick.h"
 #include "ui.h"
 
 #define ROW_H 30
@@ -35,16 +36,28 @@ typedef struct {
     int sel, top;  // selection and first visible row
 } List;
 
-enum { LS_SESSIONS, LS_SKILLS, LS_JOBS, LS_MODELS, LS_COMMANDS, LS_PREVIEW, LS_N };
+enum { LS_SESSIONS, LS_SKILLS, LS_TOOLS, LS_JOBS, LS_MODELS, LS_COMMANDS, LS_PREVIEW, LS_N };
 
 static List lists[LS_N] = {
     [LS_SESSIONS] = {.req_t = "sessions.list"},   [LS_SKILLS] = {.req_t = "skills.list"},
     [LS_JOBS] = {.req_t = "jobs.list"},           [LS_MODELS] = {.req_t = "models.list"},
     [LS_COMMANDS] = {.req_t = "commands.list"},   [LS_PREVIEW] = {.req_t = "sessions.messages"},
+    [LS_TOOLS] = {.req_t = "tools.list"},
 };
 
 static json_t *status;       // last status_r
 static uint32_t act_req;     // resume / new / job action in flight
+typedef enum { JOBS_LIST, JOBS_MENU, JOBS_DELETE } JobsStep;
+static JobsStep jstep;       // Jobs: the list, one job's actions, or "delete it?"
+static int jcell;            // Jobs: the selected action
+static char job_id[48];      // Jobs: the job the actions are for (the list may reload under them)
+static enum { SESS_LIST, SESS_MENU, SESS_DELETE } sstep;  // Sessions: the list, one session's actions, "delete it?"
+static int scell;            // Sessions: the selected action
+static char sess_id[64];     // Sessions: the session the actions are for
+static bool sess_edit;       // the PC's plugin can rename and delete sessions (welcome `sessions.edit`)
+static bool jobs_edit;       // the PC's plugin can make, change and delete jobs (welcome `jobs.edit`)
+static bool tools_view;      // Skills: showing the tools instead
+static bool sw_skills, sw_tools;  // the PC's plugin can turn skills / tools on and off (welcome `switch`)
 static char sess_q[192];     // session search (60 UTF-16 units)
 static char preview_sid[64]; // session the preview list belongs to (or is being fetched for)
 static u64 preview_due;      // fetch the preview at this time (debounces fast scrolling), 0 = none
@@ -197,12 +210,68 @@ bool tabs_handle(json_t *msg)
     act_req = 0;
     if (error) {
         app_toast(emsg);
-    } else if (!strcmp(t, "jobs.action_r")) {
+    } else if (!strcmp(t, "jobs.action_r") || !strcmp(t, "jobs.update_r")) {
         json_t *job = json_object_get(msg, "job");
         for (int i = 0; i < count(LS_JOBS); i++)
             if (!strcmp(jstr(item(LS_JOBS, i), "id"), jstr(job, "id")))
                 json_array_set(lists[LS_JOBS].items, (size_t)i, job);
+        if (!strcmp(t, "jobs.update_r")) app_toast("Saved");
+    } else if (!strcmp(t, "jobs.create_r")) {
+        json_t *job = json_object_get(msg, "job");
+        if (!lists[LS_JOBS].items) lists[LS_JOBS].items = json_array();
+        json_array_append(lists[LS_JOBS].items, job);
+        lists[LS_JOBS].sel = count(LS_JOBS) - 1;
+        char buf[96], when[32];
+        when_text(jnum(job, "next_run"), when, sizeof when);
+        snprintf(buf, sizeof buf, when[0] ? "Job made. First run: %s" : "Job made", when);
+        app_toast(buf);
+    } else if (!strcmp(t, "skills.set_r") || !strcmp(t, "tools.set_r")) {
+        bool tools = t[0] == 't', on = json_is_true(json_object_get(msg, "enabled"));
+        int k = tools ? LS_TOOLS : LS_SKILLS;
+        const char *key = tools ? "toolset" : "name", *shown = jstr(msg, key);
+        for (int i = 0; i < count(k); i++)
+            if (!strcmp(jstr(item(k, i), key), jstr(msg, key))) {
+                json_object_set_new(item(k, i), "enabled", json_boolean(on));
+                if (tools) shown = jstr(item(k, i), "label");
+            }
+        // A running chat loses a toolset at its next turn, but gains tools and changes skills only when it starts.
+        char buf[160], name[41];
+        utf8_copy(name, sizeof name, shown);
+        snprintf(buf, sizeof buf, "%s is %s for 3DS chats, from your next %s", name, on ? "on" : "off",
+                 tools && !on ? "message" : "new chat");
+        app_toast(buf);
+    } else if (!strcmp(t, "sessions.rename_r")) {
+        const char *sid = jstr(msg, "sid");
+        for (int i = 0; i < count(LS_SESSIONS); i++)
+            if (!strcmp(jstr(item(LS_SESSIONS, i), "id"), sid)) {
+                json_object_set(item(LS_SESSIONS, i), "title", json_object_get(msg, "title"));
+                if (json_is_true(json_object_get(item(LS_SESSIONS, i), "current")))
+                    utf8_copy(app.chat->title, sizeof app.chat->title, jstr(msg, "title"));
+            }
+        app_toast("Renamed");
+    } else if (!strcmp(t, "sessions.delete_r")) {
+        const char *gone = jstr(msg, "sid");
+        for (int i = 0; i < count(LS_SESSIONS); i++)
+            if (!strcmp(jstr(item(LS_SESSIONS, i), "id"), gone)) {
+                json_array_remove(lists[LS_SESSIONS].items, (size_t)i);
+                break;
+            }
+        clamp_sel(&lists[LS_SESSIONS], count(LS_SESSIONS));
+        if (!strcmp(sess_id, gone)) sstep = SESS_LIST;
+        want_preview();
+        app_toast("Session deleted");
+    } else if (!strcmp(t, "jobs.delete_r")) {
+        const char *gone = jstr(msg, "job");
+        for (int i = 0; i < count(LS_JOBS); i++)
+            if (!strcmp(jstr(item(LS_JOBS, i), "id"), gone)) {
+                json_array_remove(lists[LS_JOBS].items, (size_t)i);
+                break;
+            }
+        clamp_sel(&lists[LS_JOBS], count(LS_JOBS));
+        if (!strcmp(job_id, gone)) jstep = JOBS_LIST;
+        app_toast("Job deleted");
     }
+    app.dirty = true;
     return true;
 }
 
@@ -222,6 +291,8 @@ void tabs_online(void)
 
 void tabs_agent_changed(void)
 {
+    jstep = JOBS_LIST;
+    sstep = SESS_LIST;
     for (int k = 0; k < LS_N; k++) {
         List *l = &lists[k];
         json_decref(l->items);
@@ -248,6 +319,8 @@ void tabs_switch(Tab t)
     app.dirty = true;
     picker = false;
     if (t != TAB_BOTS && bstep == BOTS_CONFIRM) bstep = BOTS_LIST;
+    jstep = JOBS_LIST;
+    sstep = SESS_LIST;
     switch (t) {
     case TAB_CHAT: break;
     case TAB_BOTS:
@@ -257,7 +330,7 @@ void tabs_switch(Tab t)
     case TAB_SESSIONS:
         refresh(LS_SESSIONS);  // always: the current session and its title move
         break;
-    case TAB_SKILLS: refresh_if_old(LS_SKILLS); break;
+    case TAB_SKILLS: refresh_if_old(tools_view ? LS_TOOLS : LS_SKILLS); break;
     case TAB_JOBS: refresh(LS_JOBS); break;
     case TAB_MORE:
         refresh_if_old(LS_COMMANDS);
@@ -302,7 +375,8 @@ static const Cmd CMDS[CATS][CELLS] = {
     {{"diff", "Git changes"}, {"plan", "Write a plan"}, {"review", "Second opinion"},
      {"bg", "Background task"}, {"btw", "Side question"}, {"agents", "Running tasks"},
      {"goal", "Standing goal"}, {"loop", "Repeat a prompt"}, {"kanban", "Task board"}},
-    {{"sounds", "App sounds"}, {"speak", "Spoken replies"}, {"photo", "Take a photo"}, {"talk", "Voice message"}},
+    {{"sounds", "App sounds"}, {"speak", "Spoken replies"}, {"photo", "Take a photo"}, {"talk", "Voice message"},
+     {"file", "Send a file"}},
 };
 
 static bool is_local(const Cmd *c) { return c >= CMDS[CAT_3DS] && c < CMDS[CAT_3DS] + CELLS; }
@@ -322,6 +396,8 @@ static const char *local_desc(const Cmd *c)
     if (!strcmp(c->name, "speak"))
         return "Hermes answers voice messages out loud as well (/voice on) and the 3DS plays them as they arrive. "
                "Needs text-to-speech working on the PC.";
+    if (!strcmp(c->name, "file")) return "Pick a file from the SD card. Hermes gets it on the PC and can read it; add "
+                                         "a note to say what you want done with it.";
     if (!strcmp(c->name, "photo")) return "The outer or inner camera at 640x480. Hermes looks at the photo; add a "
                                           "caption to ask about it.";
     return "Hold Y in the chat, or keep a finger on Talk, and speak. Let go to send; B cancels. Up to 2 minutes; the "
@@ -337,6 +413,9 @@ static void run_local(const Cmd *c)
     } else if (!strcmp(c->name, "photo")) {
         tabs_switch(TAB_CHAT);
         camera_open();
+    } else if (!strcmp(c->name, "file")) {
+        tabs_switch(TAB_CHAT);
+        filepick_open();
     } else {
         tabs_switch(TAB_CHAT);
         app_toast("Hold " GLYPH_Y " and talk; let go to send");
@@ -568,10 +647,114 @@ static void search_sessions(void)
     refresh(LS_SESSIONS);
 }
 
-static void sessions_input(u32 down, u32 held, const touchPosition *t)
+void tabs_set_sessions_edit(bool yes) { sess_edit = yes; }
+
+// The session the actions are for, wherever a reload put it; NULL when it is gone.
+static json_t *menu_session(void)
+{
+    for (int i = 0; i < count(LS_SESSIONS); i++)
+        if (!strcmp(jstr(item(LS_SESSIONS, i), "id"), sess_id)) {
+            if (lists[LS_SESSIONS].sel != i) {
+                lists[LS_SESSIONS].sel = i;
+                want_preview();
+            }
+            return item(LS_SESSIONS, i);
+        }
+    return NULL;
+}
+
+static bool sess_ready(void)
+{
+    if (act_req) return false;
+    if (app.net != NET_ONLINE) {
+        app_toast("Not connected to the PC");
+        return false;
+    }
+    return true;
+}
+
+static void rename_session(json_t *it)
+{
+    char buf[512];
+    if (!sess_ready()) return;
+    if (!app_keyboard("A name for this session", jstr(it, "title"), buf, sizeof buf, 80, false, "Save")) return;
+    if (!buf[0] || !strcmp(buf, jstr(it, "title"))) return;
+    act_req = app_request("sessions.rename", json_pack("{s:s, s:s}", "sid", jstr(it, "id"), "title", buf));
+    app_toast("Saving...");
+}
+
+enum { SC_OPEN, SC_RENAME, SC_DELETE, SC_N };
+
+static Rect scell_rect(int i) { return (Rect){10, 78 + i * 48, 300, 40}; }
+static const Rect SESS_DELETE_BTN = {10, 128, 300, 40}, SESS_KEEP = {10, 178, 300, 34};
+
+static void session_cell(json_t *it, int i)
+{
+    switch (i) {
+    case SC_OPEN:
+        sstep = SESS_LIST;
+        resume_selected();  // (menu_session put the selection on it)
+        break;
+    case SC_RENAME: rename_session(it); break;
+    case SC_DELETE:
+        if (json_is_true(json_object_get(it, "current")))
+            app_toast("You are in this session. Start or open another one first.");
+        else if (sess_ready()) sstep = SESS_DELETE;
+        break;
+    }
+}
+
+// One session's actions, or "delete it?". Returns after handling the keys and the touch.
+static void session_menu_input(u32 down, const touchPosition *t)
+{
+    int x = t ? t->px : -1, y = t ? t->py : -1;
+    json_t *it = menu_session();
+    if (!it) {  // deleted or gone after a reload
+        sstep = SESS_LIST;
+        return;
+    }
+    if (sstep == SESS_DELETE) {
+        if ((down & KEY_A) || (t && rect_hit(&SESS_DELETE_BTN, x, y))) {
+            if (sess_ready()) {
+                act_req = app_request("sessions.delete", json_pack("{s:s}", "sid", sess_id));
+                app_toast("Deleting...");
+            }
+        } else if ((down & KEY_B) || (t && rect_hit(&SESS_KEEP, x, y))) {
+            sstep = SESS_MENU;
+        }
+        return;
+    }
+    if (down & KEY_B) sstep = SESS_LIST;
+    if ((down & UP_KEYS) && scell > 0) scell--;
+    if ((down & DOWN_KEYS) && scell < SC_N - 1) scell++;
+    if (down & KEY_A) session_cell(it, scell);
+    for (int i = 0; t && i < SC_N; i++) {
+        Rect r = scell_rect(i);
+        if (rect_hit(&r, x, y)) {
+            scell = i;
+            session_cell(it, i);
+        }
+    }
+}
+
+// A on a session: its actions when the PC can rename and delete, else straight in as before.
+static void open_selected(void)
+{
+    json_t *it = selected(LS_SESSIONS);
+    if (!it) return;
+    if (!sess_edit) {
+        resume_selected();
+        return;
+    }
+    snprintf(sess_id, sizeof sess_id, "%s", jstr(it, "id"));
+    scell = SC_OPEN;
+    sstep = SESS_MENU;
+}
+
+static void sessions_list_input(u32 down, u32 held, const touchPosition *t)
 {
     if (list_nav(LS_SESSIONS, down, held, SESS_ROWS)) want_preview();
-    if (down & KEY_A) resume_selected();
+    if (down & KEY_A) open_selected();
     if (down & KEY_X) new_session();
     if (down & KEY_Y) search_sessions();
     if (down & KEY_B) {
@@ -585,9 +768,15 @@ static void sessions_input(u32 down, u32 held, const touchPosition *t)
     if (t) {
         if (rect_hit(&SEARCH, t->px, t->py)) search_sessions();
         else if (rect_hit(&NEW_BTN, t->px, t->py)) new_session();
-        else if (list_tap(LS_SESSIONS, t, SESS_Y, SESS_ROWS)) resume_selected();
+        else if (list_tap(LS_SESSIONS, t, SESS_Y, SESS_ROWS)) open_selected();
         else want_preview();
     }
+}
+
+static void sessions_input(u32 down, u32 held, const touchPosition *t)
+{
+    if (sstep != SESS_LIST) session_menu_input(down, t);
+    else sessions_list_input(down, held, t);
     // While an earlier preview is still on its way, wait for it (its reply is dropped if the selection moved on)
     // and then fetch this one.
     if (preview_due && osGetTime() >= preview_due && !lists[LS_PREVIEW].req) {
@@ -598,6 +787,29 @@ static void sessions_input(u32 down, u32 held, const touchPosition *t)
 
 static void sessions_bottom(void)
 {
+    json_t *it = sstep == SESS_LIST ? NULL : menu_session();
+    if (it && sstep == SESS_DELETE) {
+        spaced("DELETE THIS SESSION?", 11, 36, S_EYE, COL_BAD, 1.4f);
+        text_draw_fit(session_title(it), 11, 50, S_BODY * 1.2f, COL_INK, BOT_W - 22);
+        text_block("The chat and its messages are removed from the PC. This can't be undone.", 11, 78, BOT_W - 22,
+                   S_SMALL, &DIM_COLORS, 3, NULL);
+        button(&SESS_DELETE_BTN, act_req ? "Deleting..." : "Delete it", act_req ? NULL : GLYPH_A, COL_BAD, COL_ON);
+        button(&SESS_KEEP, "Keep it", GLYPH_B, COL_PAPER, COL_INK);
+        return;
+    }
+    if (it) {
+        bool cur = json_is_true(json_object_get(it, "current"));
+        const char *const labels[SC_N] = {cur ? "Open" : "Resume", "Rename", "Delete"};
+        spaced(cur ? "CURRENT SESSION" : "SESSION", 11, 36, S_EYE, COL_INK_2, 1.4f);
+        text_draw_fit(session_title(it), 11, 50, S_BODY * 1.2f, COL_INK, BOT_W - 22);
+        for (int i = 0; i < SC_N; i++) {
+            Rect r = scell_rect(i);
+            bool sel = i == scell, off = cur && i == SC_DELETE;
+            button(&r, labels[i], sel ? GLYPH_A : NULL, sel ? COL_BLUE : COL_PAPER,
+                   sel ? COL_ON : off ? COL_TX_3 : i == SC_DELETE ? COL_BAD : COL_INK);
+        }
+        return;
+    }
     // Search box: paper, ink border, hard blue shadow (as the chat input).
     const Rect *s = &SEARCH;
     rect(s->x + 2, s->y + 2, s->w, s->h, COL_BLUE);
@@ -704,7 +916,11 @@ static void sessions_top(void)
     }
     draw_header(buf);
     json_t *sel = selected(LS_SESSIONS);
-    top_footer(sel ? (json_is_true(json_object_get(sel, "current")) ? "Open" : "Resume") : NULL, "New", "Search");
+    if (sstep == SESS_DELETE) top_footer("Delete", NULL, NULL);
+    else if (sstep == SESS_MENU) top_footer("Choose", NULL, NULL);
+    else top_footer(!sel ? NULL : sess_edit ? "Options" : json_is_true(json_object_get(sel, "current")) ? "Open"
+                                                                                                       : "Resume",
+                    "New", "Search");
 }
 
 // --- Skills ------------------------------------------------------------------
@@ -712,15 +928,42 @@ static void sessions_top(void)
 #define LIST_Y 46
 #define LIST_ROWS 6
 
+void tabs_set_switch(bool skills, bool tools) { sw_skills = skills, sw_tools = tools; }
+
+static bool is_on(json_t *it) { return json_is_true(json_object_get(it, "enabled")); }
+
+// "OFF" at a row's right edge; returns the width it took.
+static float off_mark(json_t *it, const Rect *r)
+{
+    if (is_on(it)) return 0;
+    float w = text_width("OFF", 3, S_TOOL);
+    text_draw("OFF", r->x + r->w - 10 - w, r->y + 10, S_TOOL, COL_BAD);
+    return w + 8;
+}
+
 static void skill_row(json_t *it, const Rect *r, bool sel)
 {
-    bool on = json_is_true(json_object_get(it, "enabled"));
+    bool on = is_on(it);
+    float ow = off_mark(it, r);
     const char *catg = jstr(it, "category");
     float cw = text_width(catg, strlen(catg), S_TOOL);
     if (cw > 110) cw = 110;
-    text_draw_fit(catg, r->x + r->w - 10 - cw, r->y + 10, S_TOOL, COL_TX_3, cw);
+    text_draw_fit(catg, r->x + r->w - 10 - ow - cw, r->y + 10, S_TOOL, COL_TX_3, cw);
     text_draw_fit(jstr(it, "name"), r->x + 10, r->y + 8, S_BODY * 0.95f, on ? (sel ? COL_INK : COL_INK_2) : COL_TX_3,
-                  r->w - 30 - cw);
+                  r->w - 30 - cw - ow);
+}
+
+static void tool_row(json_t *it, const Rect *r, bool sel)
+{
+    bool on = is_on(it);
+    float ow = off_mark(it, r);
+    if (on) {
+        float w = text_width("ON", 2, S_TOOL);
+        text_draw("ON", r->x + r->w - 10 - w, r->y + 10, S_TOOL, COL_BLUE);
+        ow = w + 8;
+    }
+    text_draw_fit(jstr(it, "label"), r->x + 10, r->y + 8, S_BODY * 0.95f, on ? (sel ? COL_INK : COL_INK_2) : COL_TX_3,
+                  r->w - 30 - ow);
 }
 
 // Left / right jump to the previous / next category (the list is sorted by category).
@@ -741,38 +984,140 @@ static void skills_jump(int dir)
     l->sel = i;
 }
 
+// Why the 3DS can't switch this one, or NULL when it can.
+static const char *locked(json_t *it, bool tools)
+{
+    const char *lock = jstr(it, "lock");
+    if (!strcmp(lock, "always")) return "Hermes needs this skill. It stays on.";
+    if (!strcmp(lock, "pc"))
+        return tools ? "Off for every platform. Turn it on at the computer with: hermes tools"
+                     : "Off for every platform. Turn it on at the computer with: hermes skills";
+    return NULL;
+}
+
+// Turn the selected skill or toolset on or off, for chats from a 3DS.
+static void toggle(bool tools)
+{
+    json_t *it = selected(tools ? LS_TOOLS : LS_SKILLS);
+    if (!it || act_req) return;
+    if (app.net != NET_ONLINE) {
+        app_toast("Not connected to the PC");
+        return;
+    }
+    if (!(tools ? sw_tools : sw_skills)) {
+        app_toast("Update the 3ds plugin on the PC to switch these from here");
+        return;
+    }
+    const char *why = locked(it, tools);
+    if (why) {
+        app_toast(why);
+        return;
+    }
+    const char *key = tools ? "toolset" : "name";
+    act_req = app_request(tools ? "tools.set" : "skills.set",
+                          json_pack("{s:s, s:b}", key, jstr(it, key), "enabled", !is_on(it)));
+}
+
 static void use_skill(void)
 {
     json_t *it = selected(LS_SKILLS);
     if (!it) return;
+    if (!is_on(it)) {
+        app_toast(locked(it, false) ? locked(it, false) : "This skill is off. Press " GLYPH_X " to turn it on.");
+        return;
+    }
     char buf[96];
     snprintf(buf, sizeof buf, "/%s ", jstr(it, "name"));
     app_compose(buf);
 }
 
+static const Rect VIEW_CHIP = {BOT_W - 8 - 84, 28, 84, 16};  // "TOOLS >" / "SKILLS >" beside the eyebrow
+
+static void set_view(bool tools)
+{
+    tools_view = tools;
+    refresh(tools ? LS_TOOLS : LS_SKILLS);
+    app.dirty = true;
+}
+
 static void skills_input(u32 down, u32 held, const touchPosition *t)
 {
-    u32 lr = down & (KEY_DLEFT | KEY_DRIGHT);
-    list_nav(LS_SKILLS, down & ~lr, held, LIST_ROWS);
+    int k = tools_view ? LS_TOOLS : LS_SKILLS;
+    bool chip = t && t->px >= VIEW_CHIP.x && t->py >= VIEW_CHIP.y - 4 && t->py < VIEW_CHIP.y + VIEW_CHIP.h + 2;
+    if ((down & KEY_Y) || chip) {
+        set_view(!tools_view);
+        return;
+    }
+    u32 lr = tools_view ? 0 : down & (KEY_DLEFT | KEY_DRIGHT);
+    list_nav(k, down & ~lr, held, LIST_ROWS);
     if (lr) skills_jump((lr & KEY_DRIGHT) ? 1 : -1);
-    if (down & KEY_A) use_skill();
-    if (down & KEY_Y) refresh(LS_SKILLS);
+    if (down & KEY_X) toggle(tools_view);
+    if (down & KEY_A) {
+        if (tools_view) toggle(true);
+        else use_skill();
+    }
     if (down & KEY_B) tabs_switch(TAB_CHAT);
-    if (list_tap(LS_SKILLS, t, LIST_Y, LIST_ROWS)) use_skill();
+    if (list_tap(k, t, LIST_Y, LIST_ROWS)) {
+        if (tools_view) toggle(true);
+        else use_skill();
+    }
 }
 
 static void skills_bottom(void)
 {
     char buf[32];
-    snprintf(buf, sizeof buf, "%d SKILLS", count(LS_SKILLS));
-    list_eyebrow(lists[LS_SKILLS].loaded ? buf : "SKILLS", 32);
-    draw_list(LS_SKILLS, LIST_Y, LIST_ROWS, skill_row, "No skills installed.");
-    text_draw(GLYPH_DPAD " Up/down: skill · left/right: category", 11, LIST_Y + LIST_ROWS * ROW_H + 5, S_TOOL,
-              COL_TX_3);
+    int k = tools_view ? LS_TOOLS : LS_SKILLS;
+    snprintf(buf, sizeof buf, tools_view ? "%d SETS OF TOOLS" : "%d SKILLS", count(k));
+    list_eyebrow(lists[k].loaded ? buf : tools_view ? "TOOLS" : "SKILLS", 32);
+    const char *other = tools_view ? GLYPH_Y " SKILLS" : GLYPH_Y " TOOLS";
+    frame_rect(VIEW_CHIP.x, VIEW_CHIP.y, VIEW_CHIP.w, VIEW_CHIP.h, COL_LINE_B);
+    float w = text_width(other, strlen(other), S_TOOL);
+    text_draw(other, VIEW_CHIP.x + (VIEW_CHIP.w - w) / 2, VIEW_CHIP.y + 3, S_TOOL, COL_INK_2);
+    if (tools_view) {
+        draw_list(LS_TOOLS, LIST_Y, LIST_ROWS, tool_row, "This Hermes lists no tools.");
+        text_draw(GLYPH_A " On or off, for chats from a 3DS", 11, LIST_Y + LIST_ROWS * ROW_H + 5, S_TOOL, COL_TX_3);
+    } else {
+        draw_list(LS_SKILLS, LIST_Y, LIST_ROWS, skill_row, "No skills installed.");
+        text_draw(GLYPH_DPAD " Up/down: skill · left/right: category", 11, LIST_Y + LIST_ROWS * ROW_H + 5, S_TOOL,
+                  COL_TX_3);
+    }
+}
+
+static void tools_top(void)
+{
+    char buf[96];
+    int n = count(LS_TOOLS);
+    json_t *it = selected(LS_TOOLS);
+    snprintf(buf, sizeof buf, n ? "Tools · %d of %d" : "Tools", lists[LS_TOOLS].sel + 1, n);
+    if (it) {
+        bool on = is_on(it);
+        spaced(on ? "ON FOR 3DS CHATS" : "OFF FOR 3DS CHATS", PAD_X, 25, S_EYE, on ? COL_BLUE : COL_BAD, 1.6f);
+        big_title(jstr(it, "label"), 37);
+        float y = 70 + text_block(jstr(it, "desc"), PAD_X, 70, TOP_W - 2 * PAD_X, S_BODY, &BODY_COLORS, 3, NULL);
+        y += 8;
+        rect(PAD_X, y, TOP_W - 2 * PAD_X, 1, COL_RULE);
+        const char *why = locked(it, true);
+        text_block(why ? why
+                       : on ? "Hermes can use these when you chat from a 3DS. Other places keep their own choice."
+                            : "Hermes can't use these when you chat from a 3DS. Other places keep their own choice.",
+                   PAD_X, y + 8, TOP_W - 2 * PAD_X, S_SMALL, why ? &DIM_COLORS : &BODY_COLORS, 3, NULL);
+    } else {
+        big_title("Tools", 30);
+        char what[160];
+        snprintf(what, sizeof what, "What %s can use in chats from a 3DS: the web, files, the terminal and more.",
+                 agent_title(app_agent()));
+        text_block(what, PAD_X, 64, TOP_W - 2 * PAD_X, S_BODY, &BODY_COLORS, 3, NULL);
+    }
+    draw_header(buf);
+    top_footer(it ? (is_on(it) ? "Turn off" : "Turn on") : NULL, NULL, "Skills");
 }
 
 static void skills_top(void)
 {
+    if (tools_view) {
+        tools_top();
+        return;
+    }
     char buf[96];
     int n = count(LS_SKILLS);
     json_t *it = selected(LS_SKILLS);
@@ -789,12 +1134,13 @@ static void skills_top(void)
         y += 10;
         rect(PAD_X, y, TOP_W - 2 * PAD_X, 1, COL_RULE);
         y += 8;
-        bool on = json_is_true(json_object_get(it, "enabled"));
+        bool on = is_on(it);
+        const char *why = locked(it, false);
         snprintf(buf + 40, 56, "/%s", jstr(it, "name"));
-        float w = text_draw(buf + 40, PAD_X, y, S_BODY, COL_BLUE);
+        float w = text_draw(buf + 40, PAD_X, y, S_BODY, on ? COL_BLUE : COL_TX_3);
         text_draw("<what you want>", PAD_X + w + 5, y, S_BODY, COL_TX_3);
         text_draw(on ? "Type this in chat, or press " GLYPH_A " to start it."
-                     : "Disabled for this platform. Enable it on the PC with: hermes skills",
+                     : why ? why : "Off for chats from a 3DS. Press " GLYPH_X " to turn it on.",
                   PAD_X, y + 18, S_SMALL, on ? COL_TX_2 : COL_BAD);
     } else {
         big_title("Skills", 30);
@@ -803,12 +1149,14 @@ static void skills_top(void)
         text_block(what, PAD_X, 64, TOP_W - 2 * PAD_X, S_BODY, &BODY_COLORS, 3, NULL);
     }
     draw_header(buf);
-    top_footer(it ? "Use" : NULL, NULL, "Refresh");
+    top_footer(it ? "Use" : NULL, it ? (is_on(it) ? "Turn off" : "Turn on") : NULL, "Tools");
 }
 
 // --- Jobs ---------------------------------------------------------------------
 
 static bool job_paused(json_t *it) { return !strcmp(jstr(it, "state"), "paused"); }
+// A one-time job that has run: Hermes keeps it, but it can't be paused or given a new time.
+static bool job_finished(json_t *it) { return !strcmp(jstr(it, "state"), "completed"); }
 
 static void job_row(json_t *it, const Rect *r, bool sel)
 {
@@ -818,6 +1166,7 @@ static void job_row(json_t *it, const Rect *r, bool sel)
     if (job_paused(it)) snprintf(right, sizeof right, "paused");
     else if (!strcmp(state, "running")) snprintf(right, sizeof right, "running"), rc = COL_BLUE;
     else if (!strcmp(state, "error")) snprintf(right, sizeof right, "failed"), rc = COL_BAD;
+    else if (job_finished(it)) snprintf(right, sizeof right, "finished");
     else when_text(jnum(it, "next_run"), right, sizeof right);
     float rw = text_width(right, strlen(right), S_TOOL);
     text_draw(right, r->x + r->w - 10 - rw, r->y + 3, S_TOOL, rc);
@@ -830,36 +1179,176 @@ static void job_row(json_t *it, const Rect *r, bool sel)
     (void)sel;
 }
 
-static void job_action(const char *op)
+void tabs_set_jobs_edit(bool yes) { jobs_edit = yes; }
+
+// The job the actions are for, wherever a reload put it; NULL when it is gone.
+static json_t *menu_job(void)
 {
-    json_t *it = selected(LS_JOBS);
-    if (!it || act_req) return;
+    for (int i = 0; i < count(LS_JOBS); i++)
+        if (!strcmp(jstr(item(LS_JOBS, i), "id"), job_id)) {
+            lists[LS_JOBS].sel = i;
+            return item(LS_JOBS, i);
+        }
+    return NULL;
+}
+
+static bool jobs_ready(bool editing)
+{
+    if (act_req) return false;
     if (app.net != NET_ONLINE) {
         app_toast("Not connected to the PC");
-        return;
+        return false;
     }
+    if (editing && !jobs_edit) {
+        app_toast("Update the Hermes 3DS plugin on the PC to make or change jobs");
+        return false;
+    }
+    return true;
+}
+
+static void job_action(json_t *it, const char *op)
+{
+    if (!it || !jobs_ready(false)) return;
     act_req = app_request("jobs.action", json_pack("{s:s, s:s}", "job", jstr(it, "id"), "op", op));
     app_toast(!strcmp(op, "run") ? "Running it now..." : !strcmp(op, "pause") ? "Pausing..." : "Resuming...");
 }
 
+#define SCHEDULE_HINT "When? every day at 9am · every 2h · in 30m"
+
+// Two keyboards: what to do, then when. The job reports to the chat that is open.
+static void new_job(void)
+{
+    static char prompt[3072];
+    char when[256];
+    if (!jobs_ready(true)) return;
+    if (!app_keyboard("What should Hermes do each time?", NULL, prompt, sizeof prompt, 1000, true, "Next")) return;
+    if (!app_keyboard(SCHEDULE_HINT, NULL, when, sizeof when, 80, false, "Create")) return;
+    act_req = app_request("jobs.create", json_pack("{s:s, s:s}", "schedule", when, "prompt", prompt));
+    app_toast("Making the job...");
+}
+
+// Change one field of the job: "name", "schedule" or "prompt".
+static void edit_job(json_t *it, const char *field)
+{
+    static char buf[3072];
+    if (!it || !jobs_ready(true)) return;
+    bool prompt = !strcmp(field, "prompt"), name = !strcmp(field, "name");
+    if (prompt && (json_is_true(json_object_get(it, "prompt_more")) || !json_object_get(it, "prompt"))) {
+        app_toast(json_object_get(it, "prompt") ? "This job's prompt is too long to edit on the 3DS"
+                                                : "The PC didn't send this job's prompt");
+        return;
+    }
+    const char *hint = prompt ? "What should Hermes do each time?" : name ? "A name for this job" : SCHEDULE_HINT;
+    // A schedule comes back in Hermes' own words ("every 120m"), which it also reads.
+    if (!app_keyboard(hint, jstr(it, field), buf, sizeof buf, prompt ? 1000 : name ? 60 : 80, prompt, "Save")) return;
+    if (!strcmp(buf, jstr(it, field))) return;
+    act_req = app_request("jobs.update", json_pack("{s:s, s:s}", "job", jstr(it, "id"), field, buf));
+    app_toast("Saving...");
+}
+
+enum { JC_RUN, JC_PAUSE, JC_NAME, JC_WHEN, JC_PROMPT, JC_DELETE, JC_N };
+
+static Rect jcell_rect(int i) { return (Rect){10 + (i % 2) * 154, 78 + (i / 2) * 50, 146, 42}; }
+static const Rect JOB_DELETE = {10, 128, 300, 40}, JOB_KEEP = {10, 178, 300, 34};
+
+static void job_cell(json_t *it, int i)
+{
+    if (job_finished(it) && (i == JC_PAUSE || i == JC_WHEN)) {
+        app_toast("This job has finished. Run it now, or make a new one.");
+        return;
+    }
+    switch (i) {
+    case JC_RUN: job_action(it, "run"); break;
+    case JC_PAUSE: job_action(it, job_paused(it) ? "resume" : "pause"); break;
+    case JC_NAME: edit_job(it, "name"); break;
+    case JC_WHEN: edit_job(it, "schedule"); break;
+    case JC_PROMPT: edit_job(it, "prompt"); break;
+    case JC_DELETE:
+        if (jobs_ready(true)) jstep = JOBS_DELETE;
+        break;
+    }
+}
+
 static void jobs_input(u32 down, u32 held, const touchPosition *t)
 {
+    int x = t ? t->px : -1, y = t ? t->py : -1;
+    if (jstep != JOBS_LIST) {
+        json_t *it = menu_job();
+        if (!it) {  // deleted or gone after a reload
+            jstep = JOBS_LIST;
+            return;
+        }
+        if (jstep == JOBS_DELETE) {
+            if ((down & KEY_A) || (t && rect_hit(&JOB_DELETE, x, y))) {
+                if (jobs_ready(true)) {
+                    act_req = app_request("jobs.delete", json_pack("{s:s}", "job", job_id));
+                    app_toast("Deleting...");
+                }
+            } else if ((down & KEY_B) || (t && rect_hit(&JOB_KEEP, x, y))) {
+                jstep = JOBS_MENU;
+            }
+            return;
+        }
+        if (down & KEY_B) jstep = JOBS_LIST;
+        if (down & (KEY_DLEFT | KEY_DRIGHT)) jcell ^= 1;
+        if ((down & KEY_DUP) && jcell >= 2) jcell -= 2;
+        if ((down & KEY_DDOWN) && jcell < JC_N - 2) jcell += 2;
+        if (down & KEY_A) job_cell(it, jcell);
+        for (int i = 0; t && i < JC_N; i++) {
+            Rect r = jcell_rect(i);
+            if (rect_hit(&r, x, y)) {
+                jcell = i;
+                job_cell(it, i);
+            }
+        }
+        return;
+    }
     list_nav(LS_JOBS, down, held, LIST_ROWS);
     json_t *it = selected(LS_JOBS);
-    if ((down & KEY_A) && it) job_action("run");
-    if ((down & KEY_X) && it) job_action(job_paused(it) ? "resume" : "pause");
+    bool open = (down & KEY_A) || list_tap(LS_JOBS, t, LIST_Y, LIST_ROWS);
+    if (open && it) {
+        snprintf(job_id, sizeof job_id, "%s", jstr(it, "id"));
+        jcell = JC_RUN;
+        jstep = JOBS_MENU;
+    }
+    if (down & KEY_X) new_job();
     if (down & KEY_Y) refresh(LS_JOBS);
     if (down & KEY_B) tabs_switch(TAB_CHAT);
-    if (list_tap(LS_JOBS, t, LIST_Y, LIST_ROWS)) job_action("run");
 }
 
 static void jobs_bottom(void)
 {
-    char buf[32];
-    snprintf(buf, sizeof buf, "%d SCHEDULED JOB%s", count(LS_JOBS), count(LS_JOBS) == 1 ? "" : "S");
+    char buf[96];
+    json_t *it = jstep == JOBS_LIST ? NULL : menu_job();
+    if (it && jstep == JOBS_DELETE) {
+        spaced("DELETE THIS JOB?", 11, 36, S_EYE, COL_BAD, 1.4f);
+        text_draw_fit(jstr(it, "name"), 11, 50, S_BODY * 1.2f, COL_INK, BOT_W - 22);
+        text_block("It stops running and is removed from the PC. This can't be undone.", 11, 78, BOT_W - 22, S_SMALL,
+                   &DIM_COLORS, 3, NULL);
+        button(&JOB_DELETE, act_req ? "Deleting..." : "Delete it", act_req ? NULL : GLYPH_A, COL_BAD, COL_ON);
+        button(&JOB_KEEP, "Keep it", GLYPH_B, COL_PAPER, COL_INK);
+        return;
+    }
+    if (it) {
+        static const char *const LABELS[JC_N] = {"Run now", NULL, "Rename", "Change schedule", "Change prompt",
+                                                 "Delete"};
+        spaced("JOB", 11, 36, S_EYE, COL_INK_2, 1.4f);
+        text_draw_fit(jstr(it, "name"), 11, 50, S_BODY * 1.2f, COL_INK, BOT_W - 22);
+        for (int i = 0; i < JC_N; i++) {
+            Rect r = jcell_rect(i);
+            const char *label = i == JC_PAUSE ? (job_paused(it) ? "Resume" : "Pause") : LABELS[i];
+            bool sel = i == jcell;
+            bool off = job_finished(it) && (i == JC_PAUSE || i == JC_WHEN);
+            button(&r, label, sel ? GLYPH_A : NULL, sel ? COL_BLUE : COL_PAPER,
+                   sel ? COL_ON : i == JC_DELETE ? COL_BAD : off ? COL_TX_3 : COL_INK);
+        }
+        return;
+    }
+    snprintf(buf, sizeof buf, "%d JOB%s", count(LS_JOBS), count(LS_JOBS) == 1 ? "" : "S");
     list_eyebrow(lists[LS_JOBS].loaded ? buf : "JOBS", 32);
     draw_list(LS_JOBS, LIST_Y, LIST_ROWS, job_row,
-              "No scheduled jobs yet. Ask Hermes in chat, for example: \"every weekday at 8 am, summarize my inbox\".");
+              "No scheduled jobs yet. Press " GLYPH_X " to make one, or ask Hermes in chat: \"every weekday at 8 am, "
+              "summarize my inbox\".");
 }
 
 static void kv(const char *k, const char *v, float y, u32 vc)
@@ -872,24 +1361,33 @@ static void jobs_top(void)
 {
     char buf[160], when[32];
     int n = count(LS_JOBS);
-    json_t *it = selected(LS_JOBS);
+    json_t *it = jstep == JOBS_LIST ? selected(LS_JOBS) : menu_job();
     snprintf(buf, sizeof buf, n ? "Jobs · %d of %d" : "Jobs", lists[LS_JOBS].sel + 1, n);
     if (it) {
         const char *state = jstr(it, "state");
-        spaced(job_paused(it) ? "PAUSED" : !strcmp(state, "running") ? "RUNNING NOW" : "SCHEDULED", PAD_X, 25, S_EYE,
-               job_paused(it) ? COL_TX_3 : COL_BLUE, 1.6f);
+        bool quiet = job_paused(it) || job_finished(it);
+        spaced(job_paused(it) ? "PAUSED" : job_finished(it) ? "FINISHED" : !strcmp(state, "running") ? "RUNNING NOW"
+                                                                                                    : "SCHEDULED",
+               PAD_X, 25, S_EYE, quiet ? COL_TX_3 : COL_BLUE, 1.6f);
         big_title(jstr(it, "name"), 37);
         float y = 72;
         kv("SCHEDULE", jstr(it, "schedule"), y, COL_INK);
         when_text(jnum(it, "next_run"), when, sizeof when);
-        kv("NEXT RUN", job_paused(it) ? "paused" : when[0] ? when : "not planned", y + 20, COL_INK);
+        kv("NEXT RUN", job_paused(it) ? "paused" : job_finished(it) ? "none: it has run" : when[0] ? when : "not planned",
+           y + 20, COL_INK);
         when_text(jnum(it, "last_run"), when, sizeof when);
         const char *ls = jstr(it, "last_status");
         char last[96];
         snprintf(last, sizeof last, "%s%s%s", when[0] ? when : "never", ls[0] ? " · " : "", ls);
         kv("LAST RUN", last, y + 40, !strcmp(ls, "error") || !strcmp(ls, "failed") ? COL_BAD : COL_INK);
-        const char *err = jstr(it, "last_error");
-        if (err[0]) text_block(err, PAD_X, y + 64, TOP_W - 2 * PAD_X, S_SMALL, &DIM_COLORS, 4, NULL);
+        const char *err = jstr(it, "last_error"), *prompt = jstr(it, "prompt");
+        if (err[0]) {
+            text_block(err, PAD_X, y + 64, TOP_W - 2 * PAD_X, S_SMALL, &DIM_COLORS, 4, NULL);
+        } else if (prompt[0]) {  // what it does, as far as fits
+            rect(PAD_X, y + 62, TOP_W - 2 * PAD_X, 1, COL_RULE);
+            spaced("PROMPT", PAD_X, y + 68, S_EYE, COL_TX_3, 1.2f);
+            text_block(prompt, PAD_X, y + 80, TOP_W - 2 * PAD_X, S_SMALL, &BODY_COLORS, 5, NULL);
+        }
     } else {
         big_title("Nothing scheduled", 30);
         char what[200];
@@ -898,7 +1396,9 @@ static void jobs_top(void)
         text_block(what, PAD_X, 64, TOP_W - 2 * PAD_X, S_BODY, &BODY_COLORS, 5, NULL);
     }
     draw_header(buf);
-    top_footer(it ? "Run now" : NULL, it ? (job_paused(it) ? "Resume" : "Pause") : NULL, "Refresh");
+    if (jstep == JOBS_DELETE) top_footer("Delete", NULL, NULL);
+    else if (jstep == JOBS_MENU) top_footer("Choose", NULL, NULL);
+    else top_footer(it ? "Open" : NULL, "New job", "Refresh");
 }
 
 // --- More: commands, model picker, status --------------------------------------

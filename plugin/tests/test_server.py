@@ -66,8 +66,12 @@ async def test_pair_then_reconnect(server):
     await c.close()
     assert [d.name for d in server.devices.all()] == ["Test 3DS"]
     c2 = await Client.connect("127.0.0.1", server.port, static=key, server_key=server.static.public)
-    assert "paired" not in c2.welcome
+    assert "paired" not in c2.welcome and "update" not in c2.welcome
     await c2.close()
+    server.server_info["update"] = {"latest": "0.2.2"}  # what the adapter's update check sets (§4.3)
+    c3 = await Client.connect("127.0.0.1", server.port, static=key, server_key=server.static.public)
+    assert c3.welcome["update"] == {"latest": "0.2.2"}
+    await c3.close()
 
 
 async def test_unpaired_and_reused_token_rejected(server):

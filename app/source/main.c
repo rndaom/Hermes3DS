@@ -6,6 +6,7 @@
 #include <string.h>
 
 #include "app.h"
+#include "filepick.h"
 #include "led.h"
 #include "log.h"
 #include "audio.h"
@@ -18,12 +19,10 @@
 #include "store.h"
 #include "text.h"
 #include "upload.h"
+#include "version.h"
 #include "viewer.h"
 #include "voice.h"
 
-#ifndef APP_VERSION  // set by the Makefile (VERSION_MAJOR/MINOR/MICRO)
-#define APP_VERSION "3ds-dev"
-#endif
 #define SOC_BUFFER_SIZE 0x100000
 #define ANIM_FRAME_MS 80  // spinner frame time; redraws are throttled to this when only animating
 
@@ -57,6 +56,7 @@ static const char *where(void)
     if (app.screen == SCR_PAIR) return "pairing";
     if (voice_recording()) return "recording";
     if (camera_is_open()) return "camera";
+    if (filepick_is_open()) return "picker";
     if (viewer_is_open()) return "files";
     return TABS[app.tab];
 }
@@ -144,6 +144,7 @@ int main(void)
         speak_tick();
         voice_tick();
         camera_tick();
+        filepick_tick();
         upload_tick();
         app_tick();
         u64 t_draw = perf_now(), t_end = t_draw;

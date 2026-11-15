@@ -21,6 +21,9 @@ HERMES = Path(sys.argv[1]) if len(sys.argv) > 1 else Path.home() / ".hermes" / "
 # A throwaway Hermes home: the adapter records its state (gateway_state.json) there like a gateway would,
 # and must not touch the real one.
 os.environ["HERMES_HOME"] = tempfile.mkdtemp(prefix="h3ds-it-home-")
+# A Hermes checkout that sees a fresh home starts building itself a dependency environment there (hundreds of MB,
+# and it restarts the process, so the cleanup below never runs): this keeps it from doing so.
+os.environ.setdefault("HERMES_DISABLE_LAZY_INSTALLS", "1")
 atexit.register(shutil.rmtree, os.environ["HERMES_HOME"], True)
 sys.path.insert(0, str(HERMES))
 sys.path.insert(0, str(ROOT))
@@ -53,9 +56,14 @@ class _Ctx:
     def register_cli_command(self, **kw):
         pass
 
+    def dispatch_tool(self, tool_name, args, **kw):  # as Hermes' PluginContext does, minus the plugin scope
+        from tools.registry import registry
+        return registry.dispatch(tool_name, args, **kw)
+
 
 async def main() -> int:
     tmp = Path(tempfile.mkdtemp(prefix="h3ds-it-"))
+    atexit.register(shutil.rmtree, tmp, True)
     adapter_mod._data_dir = lambda: tmp
     h3ds.register(_Ctx())
 
@@ -154,6 +162,175 @@ async def main() -> int:
         ev = await c.next_event("msg", timeout=5)
     check("offline reply delivered on reconnect", ev["mid"] == r.message_id and ev["final"]
           and ev["text"] == "Done: 3 files changed." and ev.get("spans"), str(ev))
+
+    # --- a file from the SD card: Hermes' own document cache, and what its gateway makes of the event -------
+    from gateway.platforms.event import MessageType
+    from gateway.run import _build_media_placeholder
+    got = []
+
+    async def record(event):
+        got.append(event)
+
+    ad.handle_message = record
+    await c.put_blob("uitfile1", b"alpha,beta\n1,2\n", "text/csv", "table.csv")
+    r = await c.request("send", text="what is in this?", attach=[{"blob": "uitfile1"}])
+    ev = got[0] if got else None
+    kept = Path(ev.media_urls[0]) if ev and ev.media_urls else None
+    check("a sent file becomes a document event", bool(ev) and ev.message_type == MessageType.DOCUMENT
+          and ev.media_types == ["text/csv"] and r.get("mid") == ev.message_id, str(ev))
+    check("the file is in Hermes' document cache under its name", bool(kept) and kept.name.endswith("table.csv")
+          and kept.read_bytes() == b"alpha,beta\n1,2\n", str(kept))
+    check("the gateway sees a file, not a photo", bool(ev) and "sent a file" in _build_media_placeholder(ev),
+          _build_media_placeholder(ev) if ev else "")
+    if kept:
+        kept.unlink(missing_ok=True)
+
+    # --- jobs from the 3DS: Hermes' own cron tool and job store (in the temp HERMES_HOME) ---------------------
+    import tools.cronjob_tools  # noqa: F401 - registers cronjob_manage, as Hermes' tool discovery does
+    from cron.jobs import get_job
+    ad.gateway_runner = object()  # job requests want a gateway to exist; they never ask it anything
+    try:
+        r = await c.request("jobs.create", schedule="every day at 9am", prompt="Say good morning.", name="Morning")
+        job = r["job"]
+        stored = get_job(job["id"]) or {}
+        origin = stored.get("origin") or {}
+        check("a job made on the 3DS is stored by Hermes", job["name"] == "Morning" and job["prompt"] ==
+              "Say good morning." and stored.get("prompt") == "Say good morning.", str(r))
+        check("it reports back to the 3DS chat it was made in", origin.get("platform") == "3ds"
+              and origin.get("chat_id") == chat and stored.get("deliver") in ("origin", None), str(stored))
+        r = await c.request("jobs.update", job=job["id"], schedule="every 2h", prompt="Say hello.")
+        stored = get_job(job["id"]) or {}
+        check("a change from the 3DS reaches the stored job", stored.get("prompt") == "Say hello."
+              and r["job"]["prompt"] == "Say hello." and ("2h" in r["job"]["schedule"] or "120m" in r["job"]["schedule"])
+              and (stored.get("origin") or {}).get("chat_id") == chat, str(r))
+        items = (await c.request("jobs.list"))["items"]
+        check("the list carries the whole prompt", [i.get("prompt") for i in items] == ["Say hello."], str(items))
+        try:
+            await c.request("jobs.create", schedule="when the moon is full-ish", prompt="x")
+            check("a schedule Hermes can't read is refused", False)
+        except Exception as exc:
+            check("a schedule Hermes can't read is refused", "bad_request" in str(exc), str(exc))
+        r = await c.request("jobs.delete", job=job["id"])
+        check("a job removed from the 3DS is gone", r["job"] == job["id"] and get_job(job["id"]) is None, str(r))
+    except Exception as exc:
+        check("jobs from the 3DS", False, repr(exc))
+
+    # --- skills and tools switched from the 3DS: Hermes' own config and resolution -----------------------------
+    try:
+        from agent.skill_utils import get_disabled_skill_names
+        from hermes_cli.config import load_config
+        from hermes_cli.tools_config import _get_platform_tools
+        from toolsets import resolve_toolset
+
+        def turn_tools():  # the tool names a 3DS turn is given, as the gateway resolves them
+            return {t for ts in _get_platform_tools(load_config(), "3ds") for t in resolve_toolset(ts)}
+
+        check("the welcome says the switches are there", c.welcome.get("switch") == {"skills": True, "tools": True},
+              str(c.welcome))
+        rows = {i["toolset"]: i for i in (await c.request("tools.list"))["items"]}
+        before, browser = turn_tools(), set(resolve_toolset("browser"))
+        check("the tools list is what a 3DS chat gets", rows.get("terminal", {}).get("enabled") is True
+              and rows.get("browser", {}).get("enabled") is True and "discord" not in rows
+              and "terminal" in before and browser <= before, str(sorted(rows)))
+        r = await c.request("tools.set", toolset="browser", enabled=False)
+        after = turn_tools()
+        saved = (load_config().get("platform_toolsets") or {}).get("3ds") or []
+        check("a toolset turned off on the 3DS leaves the 3DS chat", r["enabled"] is False
+              and "browser" not in saved and "hermes-3ds" not in saved, str(saved))
+        check("the chat loses those tools and no others", before - after == browser - {
+              t for ts in saved for t in resolve_toolset(ts)} and after <= before and "terminal" in after,
+              str(sorted((before - after) ^ browser)))
+        check("other platforms are untouched", browser <= {
+              t for ts in _get_platform_tools(load_config(), "telegram") for t in resolve_toolset(ts)})
+        rows = {i["toolset"]: i for i in (await c.request("tools.list"))["items"]}
+        check("the list shows it off", rows["browser"]["enabled"] is False and rows["terminal"]["enabled"] is True)
+        r = await c.request("tools.set", toolset="browser", enabled=True)
+        check("turned on again, the chat has what it had", r["enabled"] is True and turn_tools() == before,
+              str(sorted(turn_tools() ^ before)))
+
+        demo = Path(os.environ["HERMES_HOME"]) / "skills" / "it-demo"
+        demo.mkdir(parents=True, exist_ok=True)
+        (demo / "SKILL.md").write_text("---\nname: it-demo\ndescription: A skill for this check.\n---\n\nSay hi.\n",
+                                       encoding="utf-8")
+        skills = (await c.request("skills.list"))["items"]
+        free = [i["name"] for i in skills if not i.get("lock")]
+        if free:
+            name = free[0]
+            r = await c.request("skills.set", name=name, enabled=False)
+            check("a skill turned off on the 3DS is off for 3DS chats only", r["enabled"] is False
+                  and name in get_disabled_skill_names("3ds") and name not in get_disabled_skill_names("telegram"),
+                  str(load_config().get("skills")))
+            listed = {i["name"]: i for i in (await c.request("skills.list"))["items"]}
+            check("the list shows it off", listed[name]["enabled"] is False and "lock" not in listed[name])
+            r = await c.request("skills.set", name=name, enabled=True)
+            check("turned on again", r["enabled"] is True and name not in get_disabled_skill_names("3ds"))
+        else:
+            print("SKIP  skill switch (this Hermes home has no skill to switch)")
+        try:
+            await c.request("skills.set", name="hermes-agent", enabled=False)
+            check("the skill Hermes needs stays on", False)
+        except Exception as exc:
+            check("the skill Hermes needs stays on", "bad_request" in str(exc) or "not_found" in str(exc), str(exc))
+    except Exception as exc:
+        check("skills and tools from the 3DS", False, repr(exc))
+    # --- sessions renamed and deleted from the 3DS: Hermes' own session database and routing store ------------
+    try:
+        import types
+        from gateway.config import GatewayConfig
+        from gateway.session import AsyncSessionStore, SessionStore
+        from hermes_constants import get_hermes_home
+        from hermes_state import SessionDB
+        db = SessionDB()
+        store = SessionStore(Path(get_hermes_home()) / "sessions", GatewayConfig())
+        ad.gateway_runner = types.SimpleNamespace(
+            session_store=store, async_session_store=AsyncSessionStore(store),
+            _session_db=types.SimpleNamespace(_db=db))
+        check("the welcome says sessions can be changed", c.welcome.get("sessions") == {"edit": True}, str(c.welcome))
+        me = srv.devices.get(device_key.public)
+        entry = store.get_or_create_session(ad.source_for(me, None))
+        key, now_id = entry.session_key, entry.session_id
+        for sid in (now_id, "it-old", "it-other"):
+            db.create_session(sid, "3ds", session_key=key, chat_id=chat, chat_type="dm")
+            db.append_message(sid, role="user", content=f"hello from {sid}")
+        db.set_session_title("it-other", "Taxes")
+        db.create_session("it-telegram", "telegram", session_key="agent:main:telegram:dm:42")
+        ids = {i["id"] for i in (await c.request("sessions.list"))["items"]}
+        check("the list is this chat's sessions", ids == {now_id, "it-old", "it-other"}, str(ids))
+        r = await c.request("sessions.rename", sid="it-old", title="  Holiday   plans ")
+        check("a session renamed on the 3DS is renamed in Hermes", r["title"] == "Holiday plans"
+              and db.get_session_title("it-old") == "Holiday plans", str(r))
+        for what, kw in (("a name another session has is refused", {"sid": "it-old", "title": "Taxes"}),
+                         ("a name too long is refused", {"sid": "it-old", "title": "x" * 300}),
+                         ("another chat's session can't be renamed", {"sid": "it-telegram", "title": "Mine"})):
+            try:
+                await c.request("sessions.rename", **kw)
+                check(what, False)
+            except Exception as exc:
+                check(what, ("not_found" if "another chat" in what else "bad_request") in str(exc), str(exc))
+        try:
+            await c.request("sessions.delete", sid=now_id)
+            check("the session the chat is in can't be deleted", False)
+        except Exception as exc:
+            check("the session the chat is in can't be deleted", "bad_request" in str(exc)
+                  and db.get_session(now_id) is not None, str(exc))
+        try:
+            await c.request("sessions.delete", sid="it-telegram")
+            check("another chat's session can't be deleted", False)
+        except Exception as exc:
+            check("another chat's session can't be deleted", "not_found" in str(exc)
+                  and db.get_session("it-telegram") is not None, str(exc))
+        r = await c.request("sessions.delete", sid="it-old")
+        ids = {i["id"] for i in (await c.request("sessions.list"))["items"]}
+        check("a session deleted on the 3DS is gone from Hermes, with its messages", r["sid"] == "it-old"
+              and db.get_session("it-old") is None and not db.get_messages("it-old")
+              and ids == {now_id, "it-other"}, f"{r} {ids}")
+        check("the chat is still in its own session", store.get_or_create_session(
+            ad.source_for(me, None)).session_id == now_id)
+        db.close()
+    except Exception as exc:
+        import traceback
+        check("sessions from the 3DS", False, traceback.format_exc())
+
     await c.close()
 
     await ad.disconnect()

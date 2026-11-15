@@ -9,6 +9,7 @@
 #include "blob.h"
 #include "camera.h"
 #include "codec.h"
+#include "filepick.h"
 #include "log.h"
 #include "sfx.h"
 #include "speak.h"
@@ -16,6 +17,7 @@
 #include "tabs.h"
 #include "ui.h"
 #include "upload.h"
+#include "version.h"
 #include "viewer.h"
 #include "voice.h"
 
@@ -32,7 +34,8 @@ static const char *jstr(const json_t *o, const char *k)
 void app_toast(const char *msg)
 {
     utf8_copy(app.toast, sizeof app.toast, msg);  // (a bot's name in it may be cut short)
-    app.toast_until = osGetTime() + 2500;
+    size_t n = strlen(app.toast);
+    app.toast_until = osGetTime() + 2500 + (n > 40 ? (n - 40) * 45 : 0);  // a long one takes longer to read
 }
 
 static uint32_t next_id(void) { return ++app.next_id; }
@@ -57,7 +60,7 @@ bool app_any_waiting(void)
 static bool scoped(const char *t)
 {
     static const char *const T[] = {"send", "stop", "status", "approve", "answer", "commands.list", "models.list",
-                                    "skills.list", "tools.list"};
+                                    "skills.list", "tools.list", "skills.set", "tools.set"};
     if (!strncmp(t, "sessions.", 9) || !strncmp(t, "jobs.", 5)) return true;
     for (size_t i = 0; i < sizeof T / sizeof *T; i++)
         if (!strcmp(t, T[i])) return true;
@@ -407,7 +410,10 @@ static void point_at(int i)
 }
 
 // The chat showing has the user's attention: a question being answered, the mic or the camera open for it.
-static bool busy_here(void) { return app.chat->approval || app.chat->clarify || voice_active() || camera_is_open(); }
+static bool busy_here(void)
+{
+    return app.chat->approval || app.chat->clarify || voice_active() || camera_is_open() || filepick_is_open();
+}
 
 void app_select_agent(int i)
 {
@@ -835,6 +841,12 @@ void app_input(void)
         camera_input(down, held, (down & KEY_TOUCH) ? &t : NULL);
         return;
     }
+    if (filepick_is_open()) {  // full screen, both screens
+        touchPosition t;
+        if (down & KEY_TOUCH) hidTouchRead(&t);
+        filepick_input(down, held, (down & KEY_TOUCH) ? &t : NULL);
+        return;
+    }
     if (viewer_is_open()) {  // full-screen over the Chat tab, no tab bar
         touchPosition t;
         if (down & KEY_TOUCH) hidTouchRead(&t);
@@ -952,6 +964,24 @@ void app_handle_event(NetEvent *ev)
         app.tls = ev->tls;
         json_int_t up_max = json_integer_value(json_object_get(json_object_get(ev->json, "upload"), "max"));
         upload_set_max(up_max > 0 && up_max < 0x7fffffff ? (uint32_t)up_max : 0);
+        filepick_set_supported(json_is_true(json_object_get(json_object_get(ev->json, "upload"), "files")));
+        tabs_set_jobs_edit(json_is_true(json_object_get(json_object_get(ev->json, "jobs"), "edit")));
+        tabs_set_sessions_edit(json_is_true(json_object_get(json_object_get(ev->json, "sessions"), "edit")));
+        json_t *sw = json_object_get(ev->json, "switch");
+        tabs_set_switch(json_is_true(json_object_get(sw, "skills")), json_is_true(json_object_get(sw, "tools")));
+        // A newer release, found by the PC's daily check (`update.latest`): said once per run, in the main chat.
+        static int told[3];
+        int latest[3];
+        if (version_parse(jstr(json_object_get(ev->json, "update"), "latest"), latest) &&
+            memcmp(latest, told, sizeof told)) {
+            char v[24];
+            snprintf(v, sizeof v, "%d.%d.%d", latest[0], latest[1], latest[2]);
+            if (version_newer(v, APP_VERSION)) {
+                memcpy(told, latest, sizeof told);
+                chat_notice(&app.agents[0].chat, "Hermes 3DS %s is out (this is %s). Install it the same way as before.",
+                            v, APP_VERSION + 4);
+            }
+        }
         const char *name = jstr(ev->json, "server");
         if (name[0] && strcmp(name, app.server.name)) {
             snprintf(app.server.name, sizeof app.server.name, "%s", name);
@@ -1059,6 +1089,7 @@ void app_handle_event(NetEvent *ev)
                 snprintf(buf, sizeof buf, "Camera closed: %s is asking you something", agent_title(a));
                 if (camera_is_open()) app_toast(buf);
                 camera_close();
+                filepick_close();
                 if (app.tab != TAB_CHAT) tabs_switch(TAB_CHAT);
             }
             sfx_play(SFX_ATTENTION);
@@ -1150,7 +1181,7 @@ bool app_animating(void)
     if (app.screen == SCR_PAIR) return app.pstep == PAIR_SCAN || app.pstep == PAIR_WORKING;
     if (app.chat->approval || app.chat->clarify) return true;  // the "waiting m:ss" clock
     if (blob_busy() || upload_busy()) return true;           // loading spinners, save and upload progress
-    if (voice_active() || camera_animating()) return true;   // the level meter, the camera preview
+    if (voice_active() || camera_animating() || filepick_animating()) return true;   // the level meter, the camera preview
     if (audio_animating()) return true;                      // the play position
     if (app.chat->typing || app.net == NET_CONNECTING || app.net == NET_WAITING) return true;
     for (int i = app.chat->n - 1; i >= 0 && i >= app.chat->n - 8; i--)
@@ -1181,6 +1212,7 @@ void app_exit(void)
 {
     voice_exit();
     camera_exit();
+    filepick_close();
     upload_exit();
     for (int k = 0; k < MEDIA_MAX; k++) {
         json_decref(media[k].fields);

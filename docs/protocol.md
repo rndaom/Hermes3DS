@@ -261,11 +261,17 @@ whose delimiter row hasn't arrived) is held back so raw pipes never show.
 
 // server → client (handshake msg 2 payload)
 {"t":"welcome","v":1,"server":"RANDOM-PC","hermes":"<version>",
- "away":{"host":"random-pc.tail1234.ts.net","port":443}, "upload":{"max":8388608},
+ "away":{"host":"random-pc.tail1234.ts.net","port":443}, "upload":{"max":8388608,"files":true},
+ "update":{"latest":"0.2.2"},
  "chat":{ ... current chat state, §4.4 ... }}
 ```
 
 `away` is described in §2.4 (absent = not known yet, `null` = none); `upload` in §5.1.
+
+`update` (optional): `{"latest":"0.2.2"}`, the newest Hermes 3DS release as `X.Y.Z`. The server asks GitHub about
+once a day (`update_check: false` under `platforms.3ds` turns that off) and sends what it last learned; absent
+when it has never had an answer. The app compares it with its own version and, when it is older, says so once per
+run in the main chat. It installs nothing. A dev build (`3ds-dev`) never says it.
 
 Version mismatch → `{"t":"error","code":"version","msg":"..."}` and close.
 
@@ -314,9 +320,9 @@ closed for display first (`Run **all te` shows `all te` bold before the closing 
 with nothing after them yet (`**`, `` ` ``, `[`, a bare `#` or `-` line start) are held back so raw markup
 never flashes. The final `edit` carries the spans of the finished text, which win.
 
-#### 4.4.1 Voice messages and photos (client → server)
+#### 4.4.1 Voice messages, photos and files (client → server)
 
-Both are uploaded first (§5.1); the `send` that refers to them goes only after `blob.put_done`.
+All are uploaded first (§5.1); the `send` that refers to them goes only after `blob.put_done`.
 
 ```json
 {"t":"send","id":21,"text":"","voice":{"blob":"u5k2…","rate":16360,"block":1024,"ms":7310}}
@@ -330,8 +336,14 @@ Both are uploaded first (§5.1); the `send` that refers to them goes only after 
   `{"t":"heard","req":21,"text":"turn on the lights"}` instead of a chat bubble; the 3DS shows the words under
   its voice bubble. No `heard` means speech-to-text is off or failed (Hermes then tells the model a voice
   message could not be transcribed).
-- `attach`: 1 to 4 uploads of `image/jpeg` or `image/png`, handed to Hermes as photos (vision). `text` is the
-  caption and may be empty.
+- `attach`: 1 to 4 uploads. `text` is the caption and may be empty. What an upload is comes from the `mime` and
+  `name` of its `blob.put`:
+  - `image/jpeg` and `image/png` are photos (vision). One that isn't a picture gets `bad_request`.
+  - Anything else is a file (the app picks it from the SD card): the PC keeps it under its `name` and hands it to
+    Hermes as a document, so Hermes tells the model where it is and puts short text files into the turn. A `mime`
+    that is empty or `application/octet-stream` is guessed from the name. Only a server whose `welcome` has
+    `upload.files` takes these; an older one answers `bad_request` ("not a picture").
+  - A message of photos only is a photo message; with any file in it, a document message.
 - An upload that isn't complete on the PC gets `error` `not_found`; a recording that doesn't decode gets
   `bad_request`.
 
@@ -381,12 +393,28 @@ Request/response pairs (`id` echoed). Lists take optional `offset`, `limit` (def
 | `sessions.messages` | `sid, limit?, before?` | `items:[{mid,role,text,spans?,tool?,ts}]`, oldest first; `before` = message id for paging back |
 | `sessions.resume` | `sid` | ack; the switch result arrives as a `msg` (kind `command`) |
 | `sessions.new` | `title?` | same |
+| `sessions.rename` | `sid, title` | `{sid, title}`. Names a session of this chat, the current one included, under Hermes' own rules (cleaned, at most 100 characters, no two sessions with one name); a name Hermes refuses is `bad_request` with its reason. |
+| `sessions.delete` | `sid` | `{sid}`. Removes a session of this chat and its messages for good. `bad_request` for the session the chat is in, `unavailable` while Hermes is working in it. |
 | `commands.list` | — | `items:[{name,desc,args,aliases}]`: Hermes' gateway slash commands, from a snapshot shipped with the plugin (`plugin/h3proto/hermes_commands.json`, made by `tools/build_commands.py`) |
 | `models.list` | — | `{items:[{provider,name,current,models:[{id,current}]}], model, provider}`: the models `config.yaml` names (default, `providers:`, `custom_providers:`, fallbacks); `current` follows a `/model` override |
-| `skills.list` | — | `items:[{name,desc,category,enabled}]` |
-| `tools.list` | — | `items:[{toolset,label,desc,enabled,tools:[...]}]` |
-| `jobs.list` | — | `items:[{id,name,schedule,state,next_run,last_run,last_status}]` |
+| `skills.list` | — | `items:[{name,desc,category,enabled,lock?}]`. `enabled`: chats from a 3DS get the skill. `lock`: the 3DS can't switch it: `"always"` (Hermes needs it) or `"pc"` (off for every platform, which the computer changes with `hermes skills`). |
+| `skills.set` | `name, enabled` | `{name,enabled}`. Turns the skill on or off for the 3ds platform only (`skills.platform_disabled.3ds` in `config.yaml`); new chats follow it. `bad_request` for a locked skill, `not_found` for one that isn't installed. |
+| `tools.list` | — | `items:[{toolset,label,desc,enabled,lock?,tools:[...]}]`: the toolsets `hermes tools` offers for this platform. `lock:"pc"`: turned off for every platform (`agent.disabled_toolsets`). |
+| `tools.set` | `toolset, enabled` | `{toolset,enabled}`. Turns the toolset on or off for the 3ds platform only (`platform_toolsets.3ds`, what `hermes tools` saves). A running chat loses a toolset at its next message; it gains one when a new chat starts. `bad_request` for a locked toolset, `not_found` for one Hermes doesn't offer here, `unavailable` (nothing saved) when Hermes can't work out the chat's tools. |
+| `jobs.list` | — | `items:[{id,name,schedule,state,next_run,last_run,last_status,last_error,prompt?,prompt_more?}]`. `prompt` is the job's whole prompt when it is at most 1000 characters; a longer one is cut there and marked `prompt_more` (to read, not to edit). No `prompt`: this Hermes doesn't let the plugin read it. |
 | `jobs.action` | `job, op` (`pause`/`resume`/`run`) | `{job:{...}}` |
+| `jobs.create` | `schedule, prompt, name?` | `{job:{...}}`. `schedule` is in Hermes' own forms (`every 2h`, `in 30m`, `every day at 9am`, cron syntax, an ISO time), at most 80 characters; `prompt` at most 1000; `name` at most 60, and Hermes names the job from its prompt without one. The job reports to the chat it was made in: this 3DS, and the bot's chat when `agent` names a bot. `bad_request` with Hermes' own words when it refuses the schedule or the prompt. |
+| `jobs.update` | `job`, and any of `name, schedule, prompt` | `{job:{...}}`. Only the fields given change. |
+| `jobs.delete` | `job` | `{job:"<id>"}` |
+
+A server that takes `jobs.create`, `jobs.update` and `jobs.delete` says `"jobs":{"edit":true}` in its `welcome`;
+an older one answers them `bad_request`.
+
+A server that takes `sessions.rename` and `sessions.delete` says `"sessions":{"edit":true}` in its `welcome`.
+A session of another chat or platform is `not_found` for both, as for `sessions.messages`.
+
+A server that takes `skills.set` and `tools.set` says `"switch":{"skills":true,"tools":true}` in its `welcome`.
+With an `agent`, both act on that bot's own settings.
 
 Responses are `{"t":"<request>_r","id":n, ...data}`. Actions that change the session (`resume`, `new`,
 model switch) are performed by sending the slash command through Hermes, so they behave exactly like typing it.
@@ -456,7 +484,7 @@ agent with its own home: config and model, `.env`, SOUL, memory, skills, session
 chat with each.
 
 **The `agent` field.** Requests about one agent's chat carry an optional `agent`, the profile name: `send`, `stop`,
-`status`, `approve`, `answer`, `sessions.*`, `commands.list`, `models.list`, `skills.list`, `tools.list`, `jobs.*`.
+`status`, `approve`, `answer`, `sessions.*`, `commands.list`, `models.list`, `skills.list`, `skills.set`, `tools.list`, `tools.set`, `jobs.*`.
 No `agent` (or `""`, or the main profile's own name) means the main agent, which is what an app from before bots
 sends, so it keeps working unchanged. The server runs the request in that profile (its session store, its skills,
 its jobs) and echoes the request's `agent` into the reply. Server events for a bot's chat (`msg`, `append`,
@@ -529,8 +557,9 @@ Photos and voice messages go the other way with the same chunk format:
 - Limits: `size` at most 8 MiB (else `too_large`). An unfinished upload is kept for 1 hour, a finished one like
   any blob (7 days). Ids belong to the device that made them (another device's id: `denied`).
 - A finished upload is an ordinary blob: `blob.get` fetches it back.
-- The `welcome` of a server that takes uploads carries `"upload":{"max":8388608}`. Without it (an older PC
-  plugin) the client doesn't offer voice messages or photos.
+- The `welcome` of a server that takes uploads carries `"upload":{"max":8388608,"files":true}`. Without
+  `upload` (an older PC plugin) the client doesn't offer voice messages or photos; without `files` in it, no files
+  from the SD card. A `name` longer than 120 characters is cut, keeping its extension.
 
 ---
 

@@ -65,6 +65,14 @@ BOTS = [{"id": "research", "title": "Research", "desc": "Digs through papers and
          "model": "mock-research", "ui": {"color": "#3d5afe", "shape": "hexagon"}},
         {"id": "writer", "title": "Writer", "desc": "", "model": "mock-writer"}]
 
+# The Sessions tab's list: the current session and a few older ones, to open, rename and delete.
+SESSIONS = [
+    {"id": "mock-session", "title": "Mock PC", "preview": "hello", "msgs": 4, "model": "mock-model", "current": True},
+    {"id": "mock-s2", "title": "Holiday plans", "preview": "flights to Lisbon in May", "msgs": 12, "model": "mock-model"},
+    {"id": "mock-s3", "title": "", "preview": "what is the capital of Peru", "msgs": 2, "model": "mock-model"},
+    {"id": "mock-s4", "title": "Taxes", "preview": "which forms do I need", "msgs": 31, "model": "mock-model"},
+]
+
 
 def split_path(arg: str) -> tuple[str, str]:
     """'<path> [rest]' -> (path, rest); the path may be quoted."""
@@ -159,6 +167,30 @@ class MockBackend:
             return {"t": "status_r", "now": time.time(), "session": sess, "busy": False, "queued": 0}
         if t == "models.list":
             return {"t": "models.list_r", "providers": []}
+        if t == "sessions.list" and not bot:
+            now = time.time()
+            return {"t": "sessions.list_r", "items": [
+                {**row, "last_active": now - 3600 * 30 * i, "current": bool(row.get("current"))}
+                for i, row in enumerate(SESSIONS)]}
+        if t == "sessions.messages" and not bot:
+            return {"t": "sessions.messages_r", "items": [
+                {"mid": 1, "role": "user", "text": f"A question in {msg.get('sid')}", "ts": time.time() - 90},
+                {"mid": 2, "role": "assistant", "text": "(mock) and its answer.", "ts": time.time() - 60}]}
+        if t in ("sessions.rename", "sessions.delete") and not bot:
+            from h3proto.server import RequestError
+            row = next((r for r in SESSIONS if r["id"] == msg.get("sid")), None)
+            if row is None:
+                raise RequestError("not_found", "No such session. Refresh the list.")
+            if t == "sessions.rename":
+                title = " ".join(str(msg.get("title") or "").split())
+                if any(r["title"] == title and r is not row for r in SESSIONS):
+                    raise RequestError("bad_request", f"Title '{title}' is already in use by another session")
+                row["title"] = title
+                return {"t": "sessions.rename_r", "sid": row["id"], "title": title}
+            if row.get("current"):
+                raise RequestError("bad_request", "You are in this session. Start or open another one first.")
+            SESSIONS.remove(row)
+            return {"t": "sessions.delete_r", "sid": row["id"]}
         if t.endswith(".list") or t == "sessions.messages":
             return {"t": f"{t}_r", "items": []}
         if "id" in msg:
@@ -303,7 +335,7 @@ async def main() -> None:
     server = Hermes3DSServer(ServerConfig(port=args.port, discovery_port=0, name="mock-pc",
                                           away_port=args.away_port), backend,
                              load_or_create_key(work / "server_key"), DeviceStore(work / "devices.json"),
-                             TokenStore(work / "pair_tokens.json"), server_info={"hermes": "mock"}, blobs=blobs)
+                             TokenStore(work / "pair_tokens.json"), server_info={"hermes": "mock", "sessions": {"edit": True}}, blobs=blobs)
     backend.server = server
     await server.start()
     if args.away:
