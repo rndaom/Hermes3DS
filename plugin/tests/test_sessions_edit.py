@@ -31,6 +31,7 @@ class FakeDB:
         self.tips = {"s-copy": "s-now"}
         self.busy: set[str] = set()
         self.delete_calls: list[tuple[str, dict]] = []
+        self.closed = 0  # times a writer was handed back
 
     def get_session(self, sid):
         return self.rows.get(sid)
@@ -60,6 +61,9 @@ class FakeDB:
             raise SessionActiveWriteGuardError("a turn is writing")
         return self.rows.pop(sid, None) is not None
 
+    def close(self):
+        self.closed += 1
+
 
 class OldDB(FakeDB):
     """A Hermes from before the guard and chain arguments."""
@@ -70,8 +74,9 @@ class OldDB(FakeDB):
 
 
 class Runner:
-    def __init__(self, db):
-        self._session_db = types.SimpleNamespace(_db=db)  # the async facade around the gateway's writer
+    """The gateway. Its own session database is private to Hermes: touching it fails the test."""
+
+    def __init__(self):
         self.removed: list[str] = []
         self.session_store = types.SimpleNamespace(remove_by_session_id=self.removed.append)
         entry = types.SimpleNamespace(session_id="s-now", session_key=KEY)
@@ -80,16 +85,24 @@ class Runner:
             return entry
         self.async_session_store = types.SimpleNamespace(get_or_create_session=get_or_create_session)
 
+    @property
+    def _session_db(self):
+        raise AssertionError("the plugin must not use the gateway's private session database")
+
 
 @pytest.fixture
 def env(adapter_mod, monkeypatch, tmp_path):  # noqa: F811
     compat = importlib.import_module("plugin.compat")
     db = FakeDB()
+    opened: list = []  # the database path each writer was opened for (None = the main agent's)
     monkeypatch.setattr(compat, "_session_db", lambda: db)
+    monkeypatch.setattr(compat, "_open_writer", lambda path: opened.append(path) or db)
     consts = types.ModuleType("hermes_constants")
     consts.get_hermes_home = lambda: tmp_path
+    consts.get_hermes_home_override = lambda: None
     monkeypatch.setitem(sys.modules, "hermes_constants", consts)
-    return types.SimpleNamespace(compat=compat, db=db, runner=Runner(db), home=tmp_path, err=adapter_mod.RequestError)
+    return types.SimpleNamespace(compat=compat, db=db, runner=Runner(), home=tmp_path, opened=opened,
+                                 err=adapter_mod.RequestError)
 
 
 def refused(env, coro) -> tuple[str, str]:
@@ -148,15 +161,52 @@ def test_a_session_hermes_is_working_in_stays(env):
 def test_an_older_hermes_gets_only_the_arguments_it_knows(env, monkeypatch):
     db = OldDB()
     monkeypatch.setattr(env.compat, "_session_db", lambda: db)
-    runner = Runner(db)
-    assert asyncio.run(env.compat.sessions_delete(runner, None, "s-taken")) == {"sid": "s-taken"}
+    monkeypatch.setattr(env.compat, "_open_writer", lambda path: db)
+    assert asyncio.run(env.compat.sessions_delete(env.runner, None, "s-taken")) == {"sid": "s-taken"}
     assert db.delete_calls == [("s-taken", {"sessions_dir": env.home / "sessions"})]
 
 
-def test_without_a_session_database_nothing_is_tried(env):
-    env.runner._session_db = None
+def test_a_writer_that_will_not_open_is_unavailable(env, monkeypatch):
+    def broken(path):
+        raise OSError("disk says no")
+    monkeypatch.setattr(env.compat, "_open_writer", broken)
     assert refused(env, env.compat.sessions_rename(env.runner, None, "s-old", "X"))[0] == "unavailable"
     assert refused(env, env.compat.sessions_delete(env.runner, None, "s-old"))[0] == "unavailable"
+    assert env.db.rows["s-old"]["title"] is None and env.runner.removed == []
+
+
+def test_each_change_opens_its_own_writer_and_hands_it_back(env):
+    asyncio.run(env.compat.sessions_rename(env.runner, None, "s-old", "A"))
+    asyncio.run(env.compat.sessions_delete(env.runner, None, "s-old"))
+    assert env.opened == [None, None] and env.db.closed == 2  # the main agent's database, twice
+    # Refused changes hand it back too.
+    refused(env, env.compat.sessions_rename(env.runner, None, "s-taken", "Today"))
+    env.db.busy.add("s-taken")
+    refused(env, env.compat.sessions_delete(env.runner, None, "s-taken"))
+    assert env.db.closed == 4
+
+
+def test_a_bots_sessions_are_written_in_the_bots_own_database(env, monkeypatch):
+    monkeypatch.setattr(sys.modules["hermes_constants"], "get_hermes_home_override", lambda: str(env.home / "bot"))
+    asyncio.run(env.compat.sessions_rename(env.runner, None, "s-old", "A"))
+    assert env.opened == [env.home / "bot" / "state.db"]
+
+
+def test_the_writer_is_hermes_shared_one_or_a_plain_one(env, monkeypatch):
+    compat = importlib.import_module("plugin.compat")
+    monkeypatch.undo()  # the real _open_writer
+    calls = []
+    reg = types.ModuleType("hermes_state_registry")
+    reg.acquire = lambda path: calls.append(("shared", path)) or "shared-db"
+    state = types.ModuleType("hermes_state")
+    state.SessionDB = lambda **kw: calls.append(("plain", kw)) or "plain-db"
+    monkeypatch.setitem(sys.modules, "hermes_state", state)
+    monkeypatch.setitem(sys.modules, "hermes_state_registry", reg)
+    assert compat._open_writer(None) == "shared-db" and compat._open_writer(env.home / "state.db") == "shared-db"
+    monkeypatch.setitem(sys.modules, "hermes_state_registry", None)  # a Hermes without the registry
+    assert compat._open_writer(None) == "plain-db" and compat._open_writer(env.home / "state.db") == "plain-db"
+    assert calls == [("shared", None), ("shared", env.home / "state.db"),
+                     ("plain", {}), ("plain", {"db_path": env.home / "state.db"})]  # never read-only
 
 
 def test_the_requests_reach_the_backend(env, adapter_mod, monkeypatch):  # noqa: F811

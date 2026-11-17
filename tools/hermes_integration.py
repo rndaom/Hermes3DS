@@ -279,12 +279,10 @@ async def main() -> int:
         from gateway.config import GatewayConfig
         from gateway.session import AsyncSessionStore, SessionStore
         from hermes_constants import get_hermes_home
-        from hermes_state import SessionDB
-        db = SessionDB()
+        from hermes_state_registry import acquire
+        db = acquire()  # the gateway's writer; the plugin borrows the same one for each change, never the runner's
         store = SessionStore(Path(get_hermes_home()) / "sessions", GatewayConfig())
-        ad.gateway_runner = types.SimpleNamespace(
-            session_store=store, async_session_store=AsyncSessionStore(store),
-            _session_db=types.SimpleNamespace(_db=db))
+        ad.gateway_runner = types.SimpleNamespace(session_store=store, async_session_store=AsyncSessionStore(store))
         check("the welcome says sessions can be changed", c.welcome.get("sessions") == {"edit": True}, str(c.welcome))
         me = srv.devices.get(device_key.public)
         entry = store.get_or_create_session(ad.source_for(me, None))

@@ -1,6 +1,7 @@
 """Every read of Hermes' state lives here (protocol.md §4.6), so upstream churn breaks one file.
 
-Only public Hermes surfaces are used (the plugin catalog's rule 9): `hermes_state.SessionDB`, the runner's
+Only public Hermes surfaces are used (the plugin catalog's rule 9): `hermes_state.SessionDB` (read-only; a writer
+borrowed from `hermes_state_registry` for each rename or delete), the runner's
 session store and served-profile list, `hermes_cli.config`, `tools.skills_tool`, `tools.registry`, the
 `cronjob_manage` tool through the plugin context, and `hermes_constants` / `agent.secret_scope` to read another
 profile's state (a bot's) under that profile's home and secrets, as Hermes' own multiplexed gateway does. Where Hermes has no public API yet (its command catalog, the model picker's provider
@@ -409,14 +410,35 @@ async def session_messages(runner, source, sid: str, limit: int, before: int | N
     return items
 
 
-def _session_writer(runner):
-    """The gateway's own session database for the profile in scope (the one `/title` writes through). The
-    plugin's handle is read-only."""
-    db = getattr(runner, "_session_db", None)
-    db = getattr(db, "_db", db)  # unwrap the async facade
-    if db is None:
-        raise RequestError("unavailable", "Hermes' session database is not open")
-    return db
+def _writer_path() -> Path | None:
+    """Where the profile in scope keeps its sessions (None = the main agent's default). Read on the event loop:
+    a bot's `profile_scope` is what picks it."""
+    from hermes_constants import get_hermes_home_override
+    override = get_hermes_home_override()
+    return Path(override) / "state.db" if override else None
+
+
+def _open_writer(path: Path | None):
+    """A writable `SessionDB` of the plugin's own. Hermes' registry lends the one writer this process keeps per
+    database (two writers on one file can race each other's checkpoints); a Hermes without it gets a plain one."""
+    try:
+        from hermes_state_registry import acquire
+    except ImportError:
+        from hermes_state import SessionDB
+        return SessionDB(db_path=path) if path else SessionDB()
+    return acquire(path)
+
+
+@contextlib.contextmanager
+def _session_writer(path: Path | None):
+    """The writer for one change, handed back afterwards (`close()` on a lent one only returns it). The plugin's
+    lasting handle stays read-only."""
+    db = _open_writer(path)
+    try:
+        yield db
+    finally:
+        with contextlib.suppress(Exception):
+            db.close()
 
 
 async def _own_session(runner, source, sid: Any) -> tuple[str, dict[str, Any]]:
@@ -436,12 +458,16 @@ async def sessions_rename(runner, source, sid: Any, title: Any) -> dict:
     sid, _ = await _own_session(runner, source, sid)
     if not isinstance(title, str):
         raise RequestError("bad_request", "a session needs a name")
-    db = _session_writer(runner)
+
+    def write(path: Path | None) -> tuple[str, bool]:
+        with _session_writer(path) as db:
+            clean = db.sanitize_title(title)
+            if not clean:
+                raise RequestError("bad_request", "The name is empty.")
+            return clean, db.set_session_title(sid, clean)
+
     try:
-        clean = db.sanitize_title(title)
-        if not clean:
-            raise RequestError("bad_request", "The name is empty.")
-        found = await asyncio.to_thread(db.set_session_title, sid, clean)
+        clean, found = await asyncio.to_thread(write, _writer_path())
     except ValueError as exc:  # too long, taken by another session, a bot's own chat
         raise RequestError("bad_request", _clip(str(exc), 200)) from exc
     if not found:
@@ -461,26 +487,32 @@ async def sessions_delete(runner, source, sid: Any) -> dict:
     cur_tip = await asyncio.to_thread(ro.resolve_resume_session_id, cur["id"])
     if sid == cur["id"] or (tip or sid) == (cur_tip or cur["id"]):
         raise RequestError("bad_request", "You are in this session. Start or open another one first.")
-    db = _session_writer(runner)
-    # Newer Hermes: refuse while a turn is writing to it, and take the compressed copies of the chat with it.
-    accepted = inspect.signature(db.delete_session).parameters
-    kwargs = {k: v for k, v in (("sessions_dir", Path(get_hermes_home()) / "sessions"),
-                                ("exclude_active_write_guards", True), ("include_compression_chain", True))
-              if k in accepted}
+    sessions_dir = Path(get_hermes_home()) / "sessions"
+
+    def write(path: Path | None) -> bool:
+        with _session_writer(path) as db:
+            # Newer Hermes: refuse while a turn is writing to it, and take the compressed copies of the chat with it.
+            accepted = inspect.signature(db.delete_session).parameters
+            kwargs = {k: v for k, v in (("sessions_dir", sessions_dir), ("exclude_active_write_guards", True),
+                                        ("include_compression_chain", True)) if k in accepted}
+            if not db.delete_session(sid, **kwargs):
+                return False
+            with contextlib.suppress(Exception):
+                store.remove_by_session_id(sid)
+            with contextlib.suppress(Exception):
+                from gateway.session_ingress_media import collect_unheld_api_images
+                collect_unheld_api_images(db)
+            return True
+
+    store = getattr(runner, "session_store", None)
     try:
-        deleted = await asyncio.to_thread(db.delete_session, sid, **kwargs)
+        deleted = await asyncio.to_thread(write, _writer_path())
     except RuntimeError as exc:
         if type(exc).__name__ != "SessionActiveWriteGuardError":
             raise
         raise RequestError("unavailable", "Hermes is working in this session. Try again when it is done.") from exc
     if not deleted:
         raise RequestError("not_found", "No such session. Refresh the list.")
-    store = getattr(runner, "session_store", None)
-    with contextlib.suppress(Exception):
-        await asyncio.to_thread(store.remove_by_session_id, sid)
-    with contextlib.suppress(Exception):
-        from gateway.session_ingress_media import collect_unheld_api_images
-        await asyncio.to_thread(collect_unheld_api_images, db)
     return {"sid": sid}
 
 

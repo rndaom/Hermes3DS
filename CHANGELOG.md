@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.1 (2026-11-17)
+
+A plugin fix. The app is the same as 0.3.0 apart from its version number; either one still works with the
+other's 0.3.0.
+
+- **Rename and delete sessions:** the plugin now writes through a session database writer of its own, borrowed
+  from Hermes' public registry for each change (a plain `SessionDB` on a Hermes without the registry), instead
+  of the gateway's private one. Nothing changes on the 3DS.
+
 ## 0.3.0 (2026-11-15)
 
 App and plugin (0.3.0): send a file from the SD card, make, change and delete scheduled jobs, turn skills and tools
