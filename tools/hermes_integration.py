@@ -287,16 +287,36 @@ async def main() -> int:
         me = srv.devices.get(device_key.public)
         entry = store.get_or_create_session(ad.source_for(me, None))
         key, now_id = entry.session_key, entry.session_id
+        # "it-before" is the chat the 3DS is in as it was before Hermes compressed it: ended by compression, with
+        # the current session as its continuation.
+        db.create_session("it-before", "3ds", session_key=key, chat_id=chat, chat_type="dm")
+        db.append_message("it-before", role="user", content="hello from it-before")
+        db.end_session("it-before", "compression")
         for sid in (now_id, "it-old", "it-other"):
-            db.create_session(sid, "3ds", session_key=key, chat_id=chat, chat_type="dm")
+            db.create_session(sid, "3ds", session_key=key, chat_id=chat, chat_type="dm",
+                              **({"parent_session_id": "it-before"} if sid == now_id else {}))
             db.append_message(sid, role="user", content=f"hello from {sid}")
         db.set_session_title("it-other", "Taxes")
         db.create_session("it-telegram", "telegram", session_key="agent:main:telegram:dm:42")
         ids = {i["id"] for i in (await c.request("sessions.list"))["items"]}
-        check("the list is this chat's sessions", ids == {now_id, "it-old", "it-other"}, str(ids))
+        check("the list is this chat's sessions", {now_id, "it-old", "it-other"} <= ids <= {
+            now_id, "it-old", "it-other", "it-before"}, str(ids))
+        r = await c.request("sessions.messages", sid="it-before")
+        check("a compressed chat's messages run on into its newest copy",
+              [i["text"] for i in r["items"]] == ["hello from it-before", f"hello from {now_id}"], str(r))
+        try:
+            await c.request("sessions.delete", sid="it-before")
+            check("the chat's copy from before a compression can't be deleted", False)
+        except Exception as exc:
+            check("the chat's copy from before a compression can't be deleted", "bad_request" in str(exc)
+                  and db.get_session("it-before") is not None, str(exc))
         r = await c.request("sessions.rename", sid="it-old", title="  Holiday   plans ")
         check("a session renamed on the 3DS is renamed in Hermes", r["title"] == "Holiday plans"
-              and db.get_session_title("it-old") == "Holiday plans", str(r))
+              and (db.get_session("it-old") or {}).get("title") == "Holiday plans", str(r))
+        r = await c.request("sessions.messages", sid="it-other")
+        check("a session's messages can be read", [i["text"] for i in r["items"]] == ["hello from it-other"], str(r))
+        r = await c.request("status")
+        check("the status carries the session's name", "session" in r and r["session"]["id"] == now_id, str(r))
         for what, kw in (("a name another session has is refused", {"sid": "it-old", "title": "Taxes"}),
                          ("a name too long is refused", {"sid": "it-old", "title": "x" * 300}),
                          ("another chat's session can't be renamed", {"sid": "it-telegram", "title": "Mine"})):
@@ -321,7 +341,7 @@ async def main() -> int:
         ids = {i["id"] for i in (await c.request("sessions.list"))["items"]}
         check("a session deleted on the 3DS is gone from Hermes, with its messages", r["sid"] == "it-old"
               and db.get_session("it-old") is None and not db.get_messages("it-old")
-              and ids == {now_id, "it-other"}, f"{r} {ids}")
+              and "it-old" not in ids and {now_id, "it-other"} <= ids, f"{r} {ids}")
         check("the chat is still in its own session", store.get_or_create_session(
             ad.source_for(me, None)).session_id == now_id)
         db.close()

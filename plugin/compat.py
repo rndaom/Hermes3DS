@@ -1,7 +1,9 @@
 """Every read of Hermes' state lives here (protocol.md §4.6), so upstream churn breaks one file.
 
 Only public Hermes surfaces are used (the plugin catalog's rule 9): `hermes_state.SessionDB` (read-only; a writer
-borrowed from `hermes_state_registry` for each rename or delete), the runner's
+borrowed from `hermes_state_registry` for each rename or delete; since Hermes 0.23.3 also the storage interface's
+`persistence_assembly.open_persistence_reader` and `persistence.conversation.sessions.sanitize_title`, for the two
+answers `SessionDB` no longer gives), the runner's
 session store and served-profile list, `hermes_cli.config`, `tools.skills_tool`, `tools.registry`, the
 `cronjob_manage` tool through the plugin context, and `hermes_constants` / `agent.secret_scope` to read another
 profile's state (a bot's) under that profile's home and secrets, as Hermes' own multiplexed gateway does. Where Hermes has no public API yet (its command catalog, the model picker's provider
@@ -70,6 +72,33 @@ def _session_db():
             from hermes_state import SessionDB
             db = _dbs[key] = SessionDB(db_path=Path(key), read_only=True) if key else SessionDB(read_only=True)
         return db
+
+
+def _store_home() -> Path:
+    """The Hermes home of the profile in scope. Read on the event loop: a bot's `profile_scope` is what picks it."""
+    from hermes_constants import get_hermes_home, get_hermes_home_override
+    return Path(get_hermes_home_override() or get_hermes_home())
+
+
+def _resume_target(db, home: Path, sid: str) -> str | None:
+    """The session a resume of `sid` loads: the newest copy of a chat Hermes has compressed. `SessionDB` answered
+    this until Hermes 0.23.3 moved sessions behind its storage interface, where the store's lineage does."""
+    old = getattr(db, "resolve_resume_session_id", None)
+    if old is not None:
+        return old(sid)
+    from persistence_assembly import open_persistence_reader
+    with open_persistence_reader(home) as store:
+        return store.lineage.resolve_resume_target(sid)
+
+
+def _clean_title(db, title: str) -> str | None:
+    """Hermes' own cleaning of a session name (None when nothing printable is left; ValueError when too long).
+    A `SessionDB` method until Hermes 0.23.3, a function of the storage interface since."""
+    old = getattr(db, "sanitize_title", None)
+    if old is not None:
+        return old(title)
+    from persistence.conversation.sessions import sanitize_title
+    return sanitize_title(title)
 
 
 def _config() -> dict[str, Any]:
@@ -308,10 +337,11 @@ async def status(runner, source, busy: bool, queued: int = 0) -> dict[str, Any]:
     cur = await current_session(runner, source)
     db = _session_db()
     row = await asyncio.to_thread(db.get_session, cur["id"]) or {}
-    try:
-        title = await asyncio.to_thread(db.get_session_title, cur["id"])
-    except Exception:
-        title = row.get("title")
+    title = row.get("title")
+    get_title = getattr(db, "get_session_title", None)  # gone in Hermes 0.23.3; the row carries the title
+    if get_title is not None:
+        with contextlib.suppress(Exception):
+            title = await asyncio.to_thread(get_title, cur["id"])
     model = await _live_model(runner, cur["key"]) or row.get("model") or ""
     return {
         "session": {
@@ -383,7 +413,7 @@ async def session_messages(runner, source, sid: str, limit: int, before: int | N
     row = await asyncio.to_thread(db.get_session, sid)
     if not _visible(row, cur["key"]):
         raise RequestError("not_found", "no such session for this device")
-    resolved = await asyncio.to_thread(db.resolve_resume_session_id, sid)
+    resolved = await asyncio.to_thread(_resume_target, db, _store_home(), sid)
     msgs = await asyncio.to_thread(db.get_messages, resolved or sid, latest=True, include_ancestors=True,
                                    limit=500)
     if before is not None:
@@ -461,7 +491,7 @@ async def sessions_rename(runner, source, sid: Any, title: Any) -> dict:
 
     def write(path: Path | None) -> tuple[str, bool]:
         with _session_writer(path) as db:
-            clean = db.sanitize_title(title)
+            clean = _clean_title(db, title)
             if not clean:
                 raise RequestError("bad_request", "The name is empty.")
             return clean, db.set_session_title(sid, clean)
@@ -483,8 +513,9 @@ async def sessions_delete(runner, source, sid: Any) -> dict:
     from hermes_constants import get_hermes_home
     sid, cur = await _own_session(runner, source, sid)
     ro = _session_db()
-    tip = await asyncio.to_thread(ro.resolve_resume_session_id, sid)
-    cur_tip = await asyncio.to_thread(ro.resolve_resume_session_id, cur["id"])
+    home = _store_home()
+    tip = await asyncio.to_thread(_resume_target, ro, home, sid)
+    cur_tip = await asyncio.to_thread(_resume_target, ro, home, cur["id"])
     if sid == cur["id"] or (tip or sid) == (cur_tip or cur["id"]):
         raise RequestError("bad_request", "You are in this session. Start or open another one first.")
     sessions_dir = Path(get_hermes_home()) / "sessions"

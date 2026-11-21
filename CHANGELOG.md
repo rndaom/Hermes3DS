@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.3.2 (2026-11-20)
+
+A plugin fix for Hermes 0.23.3 and later. The app is the same as 0.3.1 apart from its version number; either one
+still works with the other's 0.3.1.
+
+- **Sessions on Hermes 0.23.3:** Hermes moved its session storage behind a new interface and dropped three
+  functions the plugin called. On that Hermes, renaming a session answered "unavailable on this Hermes version",
+  and opening a session's messages and deleting one failed the same way. The plugin now asks the new interface
+  where the old functions are gone, and works as before on older Hermes (checked on 0.22.5, 0.23.2, 0.23.3 and
+  Hermes' main branch).
+
 ## 0.3.1 (2026-11-17)
 
 A plugin fix. The app is the same as 0.3.0 apart from its version number; either one still works with the

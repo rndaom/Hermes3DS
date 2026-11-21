@@ -294,6 +294,11 @@ the app without a model), `tools/hermes_integration.py` (adapter checks inside a
 
 The wire protocol is documented in [docs/protocol.md](docs/protocol.md).
 
+## Contributing
+
+Bug reports, ideas and pull requests are welcome: see [CONTRIBUTING.md](CONTRIBUTING.md). Security problems go
+through [SECURITY.md](SECURITY.md).
+
 ## Licence and credits
 
 MIT, see [LICENSE](LICENSE). Third-party components and their licences: [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).

@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Security problem
+    url: https://github.com/rndaom/Hermes3DS/security/advisories/new
+    about: Report a vulnerability privately, never in a public issue.
+  - name: A problem in Hermes itself
+    url: https://github.com/NousResearch/hermes-agent/issues
+    about: The agent, its models and its other platforms belong to Nous Research.

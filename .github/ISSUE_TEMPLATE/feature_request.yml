@@ -1,0 +1,21 @@
+name: Feature request
+description: Something you would like to do from the 3DS
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: want
+    attributes:
+      label: What would you like to do
+      description: The thing you want to get done, more than how it should be built.
+    validations:
+      required: true
+  - type: textarea
+    id: now
+    attributes:
+      label: What you do today instead
+      description: A workaround, another device, or nothing.
+  - type: textarea
+    id: more
+    attributes:
+      label: Anything else
+      description: Sketches, how other Hermes platforms do it, which console you use.

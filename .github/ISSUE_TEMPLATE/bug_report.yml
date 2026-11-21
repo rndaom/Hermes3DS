@@ -1,0 +1,72 @@
+name: Bug report
+description: Something in the app or the plugin doesn't work
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. Security problems go through the Security tab, not here.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what happened instead. Any message on the 3DS helps, word for word.
+    validations:
+      required: true
+  - type: input
+    id: app
+    attributes:
+      label: App version
+      description: The release you installed on the 3DS.
+      placeholder: "0.3.1"
+    validations:
+      required: true
+  - type: input
+    id: plugin
+    attributes:
+      label: Plugin version
+      description: "`hermes 3ds doctor` prints it."
+      placeholder: "0.3.1"
+    validations:
+      required: true
+  - type: input
+    id: hermes
+    attributes:
+      label: Hermes version
+      description: "`hermes --version`, and the system Hermes runs on."
+      placeholder: "0.23.3 on Linux"
+    validations:
+      required: true
+  - type: dropdown
+    id: console
+    attributes:
+      label: Console
+      options:
+        - Old 3DS / 3DS XL
+        - New 3DS / New 3DS XL
+        - 2DS
+        - New 2DS XL
+        - Emulator
+    validations:
+      required: true
+  - type: dropdown
+    id: where
+    attributes:
+      label: Where were you
+      options:
+        - At home (same network as Hermes)
+        - Away from home (Tailscale Funnel)
+        - It happens in both
+    validations:
+      required: true
+  - type: textarea
+    id: doctor
+    attributes:
+      label: "`hermes 3ds doctor` output"
+      description: For connection and pairing problems. Remove anything you want to keep private, such as addresses.
+      render: text
+  - type: textarea
+    id: more
+    attributes:
+      label: Anything else
+      description: Photos of the screens, the gateway log around the time, how often it happens.

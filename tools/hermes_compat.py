@@ -45,6 +45,9 @@ HERMES_TOP = {"gateway", "hermes_cli", "hermes_constants", "hermes_state", "herm
               "toolsets"}
 # Reached by attribute, not by import (compat.py: the runner the gateway hands the adapter).
 RUNNER_ATTRS = ("served_profile_names", "reconcile_served_profiles", "async_session_store")
+# Session answers that moved in Hermes 0.23.3 (compat.py `_resume_target`, `_clean_title`): one of each pair is needed.
+EITHER = (("hermes_state.SessionDB.resolve_resume_session_id", "persistence_assembly.open_persistence_reader"),
+          ("hermes_state.SessionDB.sanitize_title", "persistence.conversation.sessions.sanitize_title"))
 SKIP_COMMANDS = {"start", "topic"}  # as tools/build_commands.py
 
 
@@ -82,6 +85,24 @@ def _params(obj) -> str:
         return "?"
     return "(" + ", ".join(("*" if p.kind == p.VAR_POSITIONAL else "**" if p.kind == p.VAR_KEYWORD else "")
                            + p.name + ("=" if p.default is not p.empty else "") for p in ps) + ")"
+
+
+def _has(dotted: str) -> bool:
+    """Whether `module.name` or `module.Class.name` is there in the Hermes on the path."""
+    import importlib
+    parts = dotted.split(".")
+    for cut in range(len(parts) - 1, 0, -1):
+        try:
+            obj = importlib.import_module(".".join(parts[:cut]))
+        except Exception:
+            continue
+        try:
+            for name in parts[cut:]:
+                obj = getattr(obj, name)
+        except AttributeError:
+            return False
+        return True
+    return False
 
 
 def probe(hermes: Path) -> dict:
@@ -128,6 +149,9 @@ def probe(hermes: Path) -> dict:
         import hermes_state
         out["missing"] += [f"hermes_state.SessionDB.{n}" for n in sessiondb_calls()
                            if not hasattr(hermes_state.SessionDB, n)]
+        for pair in EITHER:
+            if not any(_has(dotted) for dotted in pair):
+                out["missing"].append(" or ".join(pair))
         from tools.registry import registry
         if not hasattr(registry, "get_available_toolsets"):
             out["missing"].append("tools.registry.registry.get_available_toolsets")

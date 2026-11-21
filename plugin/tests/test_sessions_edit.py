@@ -1,6 +1,7 @@
 """Sessions renamed and deleted from the 3DS (docs/protocol.md §4.6), against a stand-in for Hermes' session
 database and the gateway's routing store."""
 import asyncio
+import contextlib
 import importlib
 import sys
 import types
@@ -207,6 +208,51 @@ def test_the_writer_is_hermes_shared_one_or_a_plain_one(env, monkeypatch):
     assert compat._open_writer(None) == "plain-db" and compat._open_writer(env.home / "state.db") == "plain-db"
     assert calls == [("shared", None), ("shared", env.home / "state.db"),
                      ("plain", {}), ("plain", {"db_path": env.home / "state.db"})]  # never read-only
+
+
+def _gone(self):
+    raise AttributeError("hermes_state.SessionDB has no such attribute")
+
+
+class NewDB(FakeDB):
+    """Hermes 0.23.3 and later: the storage interface answers what these three `SessionDB` methods did."""
+    resolve_resume_session_id = property(_gone)
+    sanitize_title = property(_gone)
+    get_session_title = property(_gone)
+
+
+def test_a_hermes_with_the_storage_interface_renames_and_deletes(env, monkeypatch):
+    db = NewDB()
+    monkeypatch.setattr(env.compat, "_session_db", lambda: db)
+    monkeypatch.setattr(env.compat, "_open_writer", lambda path: db)
+    read: list = []  # the Hermes home each reader was opened on
+
+    @contextlib.contextmanager
+    def open_persistence_reader(home):
+        read.append(home)
+        yield types.SimpleNamespace(lineage=types.SimpleNamespace(
+            resolve_resume_target=lambda sid: db.tips.get(sid, sid)))
+
+    assembly = types.ModuleType("persistence_assembly")
+    assembly.open_persistence_reader = open_persistence_reader
+    rules = types.ModuleType("persistence.conversation.sessions")
+    rules.sanitize_title = lambda title: FakeDB.sanitize_title(db, title)
+    monkeypatch.setitem(sys.modules, "persistence_assembly", assembly)
+    for name in ("persistence", "persistence.conversation"):
+        monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
+    monkeypatch.setitem(sys.modules, "persistence.conversation.sessions", rules)
+
+    r = asyncio.run(env.compat.sessions_rename(env.runner, None, "s-old", "  Holiday\x00   plans "))
+    assert r == {"sid": "s-old", "title": "Holiday plans"}
+    assert refused(env, env.compat.sessions_rename(env.runner, None, "s-old", "x" * 101))[0] == "bad_request"
+    # An older copy of the chat you are in is still the chat you are in.
+    assert refused(env, env.compat.sessions_delete(env.runner, None, "s-copy"))[0] == "bad_request"
+    assert asyncio.run(env.compat.sessions_delete(env.runner, None, "s-old")) == {"sid": "s-old"}
+    assert "s-old" not in db.rows and read and set(read) == {env.home}
+    # A bot's sessions are read in the bot's own home.
+    monkeypatch.setattr(sys.modules["hermes_constants"], "get_hermes_home_override", lambda: str(env.home / "bot"))
+    asyncio.run(env.compat.sessions_delete(env.runner, None, "s-taken"))
+    assert read[-1] == env.home / "bot"
 
 
 def test_the_requests_reach_the_backend(env, adapter_mod, monkeypatch):  # noqa: F811
