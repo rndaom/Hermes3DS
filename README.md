@@ -65,6 +65,8 @@ They were taken before 0.2.0, which added the **Bots** tab between Chat and Sess
 - **Encrypted:** everything between the 3DS and your computer is end-to-end encrypted (Noise IK), and only a
   3DS you paired can connect.
 - **Update notice:** when a newer release is out, the app tells you in the chat.
+- **3D and motion:** with the 3D slider up, the chat has depth (the transcript behind the screen, an approval
+  card in front); new messages, cards and touched buttons move a little.
 
 ## How it works
 

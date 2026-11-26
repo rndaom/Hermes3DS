@@ -6,6 +6,7 @@
 
 #include "codec.h"
 #include "image.h"
+#include "motion.h"
 
 float S_BODY, S_SMALL, S_EYE, S_TOOL, S_TITLE, S_BIG, S_HINT;
 
@@ -35,6 +36,75 @@ void ui_init(void)
     S_HINT = 9.0f / lf;
     S_TITLE = 10.0f / lf;
     S_BIG = 30.0f / lf;
+}
+
+// --- stereo depth, fades, button presses --------------------------------------
+
+static int eye;           // -1 left, +1 right, 0 none
+static float eye_slider;  // 0..1
+static int eye_off;       // the x shift in effect
+
+void ui_depth(float depth)
+{
+    int l = 0, r = 0;
+    if (eye) motion_eye_offsets(depth, eye_slider, &l, &r);
+    int off = eye < 0 ? l : r;
+    if (off == eye_off) return;
+    eye_off = off;
+    C2D_ViewReset();
+    if (off) C2D_ViewTranslate((float)off, 0);
+}
+
+void ui_eye(int which, float slider)
+{
+    eye = which;
+    eye_slider = slider;
+    ui_depth(0);
+}
+
+void ui_fade(u32 bg, float amount)
+{
+    if (amount <= 0) {
+        C2D_Fade(0);
+        return;
+    }
+    if (amount > 1) amount = 1;
+    C2D_Fade((bg & 0x00ffffff) | ((u32)(amount * 255.0f) << 24));
+}
+
+static Rect press_rect;
+static u64 press_touch, press_at;  // when the touch landed; when the shrink was first drawn (0: not yet)
+
+void ui_press(const Rect *r)
+{
+    press_rect = *r;
+    press_touch = osGetTime();
+    press_at = 0;
+    app.dirty = true;
+}
+
+Rect ui_pressed(const Rect *r)
+{
+    Rect out = *r;
+    if (!press_touch || r->x != press_rect.x || r->y != press_rect.y || r->w != press_rect.w ||
+        r->h != press_rect.h)
+        return out;
+    u64 now = osGetTime();
+    if (!press_at) {
+        // The clock starts at the first frame drawn after the touch, so what the button did (sending,
+        // saving) doesn't eat the motion. After a long wait (the keyboard was open) it is skipped.
+        if (now - press_touch > 250) {
+            press_touch = 0;
+            return out;
+        }
+        press_at = now;
+        app_motion(now + MOTION_PRESS_MS);
+    }
+    // Whole pixels, so its edges stay sharp: 2 px smaller for the first half, 1 px for the second.
+    float in = ceilf(2.0f * (1.0f - motion_progress(now, press_at, MOTION_PRESS_MS)));
+    if (in <= 0 || r->w <= 2 * in + 4 || r->h <= 2 * in + 4) return out;
+    out.x += in, out.y += in, out.w -= 2 * in, out.h -= 2 * in;
+    return out;
 }
 
 // --- primitives -------------------------------------------------------------
@@ -172,8 +242,10 @@ float hint(const char *glyph, const char *label, float x, float y, u32 color)
     return w + 10;
 }
 
-void button(const Rect *r, const char *label, const char *glyph, u32 bg, u32 fg)
+void button(const Rect *at, const char *label, const char *glyph, u32 bg, u32 fg)
 {
+    Rect pressed = ui_pressed(at);
+    const Rect *r = &pressed;
     rect(r->x, r->y, r->w, r->h, bg);
     rect(r->x, r->y + r->h - 1, r->w, 1, C32(0, 0, 0, 0x40));
     rect(r->x + r->w - 1, r->y, 1, r->h, C32(0, 0, 0, 0x40));

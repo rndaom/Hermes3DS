@@ -81,6 +81,7 @@ typedef struct {
     bool quit;
     bool dirty;
     u64 now;
+    u64 motion_until;  // something is moving until then: every frame is drawn (app_motion)
 
     Agent agents[AGENT_MAX];
     int nagents;           // agents[0] is the main agent
@@ -174,7 +175,8 @@ bool app_animating(void);  // spinner / caret / toast need redraws
 
 void draw_init(void);
 void draw_exit(void);
-void draw_frame(C3D_RenderTarget *top, C3D_RenderTarget *bottom);
+// `top_right` is the right eye's picture of the top screen, drawn when the 3D slider is up.
+void draw_frame(C3D_RenderTarget *top, C3D_RenderTarget *top_right, C3D_RenderTarget *bottom);
 
 // Layout shared by draw.c and app.c (touch areas).
 #define TOP_HEADER_H 16
@@ -218,7 +220,17 @@ void bottom_layout(BottomLayout *l);
 int clar_count(void);          // the pending clarify's choices (0: open-ended)
 const char *clar_choice(int i);
 bool clar_multi(void);         // several choices may be picked
+// Something on screen moves until `until` (osGetTime): keep drawing every frame until then.
+static inline void app_motion(u64 until)
+{
+    if (until > app.motion_until) app.motion_until = until;
+}
+
+void ui_press(const Rect *r);  // ui.c: a touch landed on this button (it shrinks and springs back)
+
 static inline bool rect_hit(const Rect *r, int x, int y)
 {
-    return x >= r->x && x < r->x + r->w && y >= r->y && y < r->y + r->h;
+    bool hit = x >= r->x && x < r->x + r->w && y >= r->y && y < r->y + r->h;
+    if (hit) ui_press(r);  // (every caller asks about a touch that just landed)
+    return hit;
 }

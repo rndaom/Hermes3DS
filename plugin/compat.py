@@ -1,9 +1,9 @@
 """Every read of Hermes' state lives here (protocol.md §4.6), so upstream churn breaks one file.
 
-Only public Hermes surfaces are used (the plugin catalog's rule 9): `hermes_state.SessionDB` (read-only; a writer
-borrowed from `hermes_state_registry` for each rename or delete; since Hermes 0.23.3 also the storage interface's
-`persistence_assembly.open_persistence_reader` and `persistence.conversation.sessions.sanitize_title`, for the two
-answers `SessionDB` no longer gives), the runner's
+Only public Hermes surfaces are used (the plugin catalog's rule 9): for sessions, Hermes' storage interface
+(`persistence_assembly.open_persistence_reader` for reads, `open_persistence` for each rename or delete, and the
+query types of `persistence.conversation`) on Hermes 0.23.3 and later, and `hermes_state.SessionDB` (read-only; a
+writer borrowed from `hermes_state_registry` for each change) on a Hermes from before it; the runner's
 session store and served-profile list, `hermes_cli.config`, `tools.skills_tool`, `tools.registry`, the
 `cronjob_manage` tool through the plugin context, and `hermes_constants` / `agent.secret_scope` to read another
 profile's state (a bot's) under that profile's home and secrets, as Hermes' own multiplexed gateway does. Where Hermes has no public API yet (its command catalog, the model picker's provider
@@ -38,7 +38,8 @@ from .h3proto.server import RequestError
 log = logging.getLogger("hermes3ds")
 
 _ctx: Any = None  # the PluginContext register() got; tools are dispatched through it
-_dbs: dict[str, Any] = {}  # read-only session databases: "" = the main agent's, else a bot's state.db path
+_dbs: dict[str, Any] = {}  # Hermes before 0.23.3: read-only SessionDBs, "" = the main agent's, else a bot's state.db path
+_readers: dict[str, tuple[Any, Any]] = {}  # Hermes home -> (read-only storage interface handle, what closes it)
 _db_lock = threading.Lock()
 
 
@@ -60,9 +61,129 @@ def _guard(fn):
     return wrapper
 
 
+def _store_home() -> Path:
+    """The Hermes home of the profile in scope (the main agent's, or a bot's inside `profile_scope`). Read on the
+    event loop: the scope is what picks it."""
+    from hermes_constants import get_hermes_home, get_hermes_home_override
+    return Path(get_hermes_home_override() or get_hermes_home())
+
+
+# --- Hermes' sessions, behind one small set of calls ------------------------------------------------------
+#
+# Hermes 0.23.3 moved sessions behind its storage interface and keeps `hermes_state` only as a stand-in that
+# goes away in 0.27. `_StoreSessions` speaks the interface; `_LegacySessions` speaks `SessionDB` for a Hermes
+# from before it. Both return the plain dicts `SessionDB` always returned.
+
+MESSAGES_READ = 500  # the newest rows of a chat read for its history
+
+
+def _storage_interface() -> bool:
+    """Whether this Hermes has the storage interface (0.23.3 and later)."""
+    try:
+        import persistence_assembly
+    except ImportError:
+        return False
+    return hasattr(persistence_assembly, "open_persistence") and hasattr(persistence_assembly, "open_persistence_reader")
+
+
+class _StoreSessions:
+    """Sessions through a storage interface handle."""
+
+    def __init__(self, store):
+        self.store = store
+
+    def get_session(self, sid: str) -> dict | None:
+        record = self.store.sessions.get(sid)
+        return None if record is None else record.as_session_row()
+
+    def list_sessions(self, *, source: str, session_key: str, search: str | None, limit: int, offset: int) -> list[dict]:
+        from persistence.conversation.sessions import SessionOrder, SessionQuery, SessionWindow
+        query = SessionQuery(sources=(source,), session_key=session_key, search_text=search,
+                             order=SessionOrder.LAST_ACTIVE if search else SessionOrder.STARTED_AT)
+        return [entry.as_list_row() for entry in
+                self.store.sessions.list_sessions(query, SessionWindow(limit=max(limit, 0), offset=max(offset, 0)))]
+
+    def resume_target(self, sid: str) -> str | None:
+        return self.store.lineage.resolve_resume_target(sid)
+
+    def messages(self, sid: str) -> list[dict]:
+        from persistence.conversation.messages import TranscriptRead
+        request = TranscriptRead(limit=MESSAGES_READ, latest=True, include_lineage=True)
+        return [row.as_wire_row() for row in self.store.messages.read_transcript(sid, request)]
+
+    def clean_title(self, title: str) -> str | None:
+        from persistence.conversation.sessions import sanitize_title
+        return sanitize_title(title)
+
+    def set_title(self, sid: str, title: str) -> bool:
+        return bool(self.store.sessions.set_title(sid, title))
+
+    def delete(self, sid: str, sessions_dir: Path) -> bool:
+        """As Hermes' own delete (its API server's): refused while a turn is writing to the session, the chat's
+        compressed copies go with it, then Hermes' work after a delete (its hook, media nothing holds any more,
+        the transcript files)."""
+        removed = self.store.sessions.delete(sid, refuse_guarded=True, include_compression_chain=True,
+                                             media_root=_media_root())
+        # Not one of the plugin guide's names: it is what removes the deleted chat's transcript files and tells
+        # other plugins (`on_session_delete`), and Hermes' own delete calls it right after the same `delete`.
+        with contextlib.suppress(Exception):
+            from session_retention import after_sessions_removed
+            after_sessions_removed(self.store, self.store.scope.profile_dir, removed, reason="delete", primary=sid,
+                                   sessions_dir=sessions_dir)
+        return bool(removed)
+
+    def collect_images(self) -> None:
+        from gateway.session_ingress_media import collect_unheld_api_images
+        collect_unheld_api_images(self.store)
+
+
+def _media_root() -> str:
+    """Where the profile in scope keeps the files its sessions hold, which a delete removes with them (the place
+    Hermes' session storage guide gives)."""
+    from hermes_constants import get_hermes_dir
+    return str((get_hermes_dir("cache/documents", "document_cache") / "native-inputs").resolve())
+
+
+class _LegacySessions:
+    """Sessions through `hermes_state.SessionDB` (Hermes before 0.23.3)."""
+
+    def __init__(self, db):
+        self.db = db
+
+    def get_session(self, sid: str) -> dict | None:
+        return self.db.get_session(sid)
+
+    def list_sessions(self, *, source: str, session_key: str, search: str | None, limit: int, offset: int) -> list[dict]:
+        return self.db.list_sessions_rich(source=source, session_key=session_key, search_query=search,
+                                          order_by_last_active=bool(search), limit=limit, offset=offset)
+
+    def resume_target(self, sid: str) -> str | None:
+        return self.db.resolve_resume_session_id(sid)
+
+    def messages(self, sid: str) -> list[dict]:
+        return self.db.get_messages(sid, latest=True, include_ancestors=True, limit=MESSAGES_READ)
+
+    def clean_title(self, title: str) -> str | None:
+        return self.db.sanitize_title(title)
+
+    def set_title(self, sid: str, title: str) -> bool:
+        return bool(self.db.set_session_title(sid, title))
+
+    def delete(self, sid: str, sessions_dir: Path) -> bool:
+        # Newer ones refuse while a turn is writing to it, and take the compressed copies of the chat with it.
+        accepted = inspect.signature(self.db.delete_session).parameters
+        kwargs = {k: v for k, v in (("sessions_dir", sessions_dir), ("exclude_active_write_guards", True),
+                                    ("include_compression_chain", True)) if k in accepted}
+        return bool(self.db.delete_session(sid, **kwargs))
+
+    def collect_images(self) -> None:
+        from gateway.session_ingress_media import collect_unheld_api_images
+        collect_unheld_api_images(self.db)
+
+
 def _session_db():
-    """The session database of the profile in scope (the main agent's, or a bot's inside `profile_scope`),
-    opened read-only once (the gateway keeps its own writer)."""
+    """Hermes before 0.23.3: the `SessionDB` of the profile in scope, opened read-only once (the gateway keeps its
+    own writer)."""
     from hermes_constants import get_hermes_home_override
     override = get_hermes_home_override()
     key = str(Path(override) / "state.db") if override else ""
@@ -74,31 +195,51 @@ def _session_db():
         return db
 
 
-def _store_home() -> Path:
-    """The Hermes home of the profile in scope. Read on the event loop: a bot's `profile_scope` is what picks it."""
-    from hermes_constants import get_hermes_home, get_hermes_home_override
-    return Path(get_hermes_home_override() or get_hermes_home())
-
-
-def _resume_target(db, home: Path, sid: str) -> str | None:
-    """The session a resume of `sid` loads: the newest copy of a chat Hermes has compressed. `SessionDB` answered
-    this until Hermes 0.23.3 moved sessions behind its storage interface, where the store's lineage does."""
-    old = getattr(db, "resolve_resume_session_id", None)
-    if old is not None:
-        return old(sid)
+def _open_reader(home: Path):
+    """A read-only storage interface handle on a profile's store, and what closes it."""
     from persistence_assembly import open_persistence_reader
-    with open_persistence_reader(home) as store:
-        return store.lineage.resolve_resume_target(sid)
+    stack = contextlib.ExitStack()
+    try:
+        return stack.enter_context(open_persistence_reader(home)), stack
+    except BaseException:
+        stack.close()
+        raise
 
 
-def _clean_title(db, title: str) -> str | None:
-    """Hermes' own cleaning of a session name (None when nothing printable is left; ValueError when too long).
-    A `SessionDB` method until Hermes 0.23.3, a function of the storage interface since."""
-    old = getattr(db, "sanitize_title", None)
-    if old is not None:
-        return old(title)
-    from persistence.conversation.sessions import sanitize_title
-    return sanitize_title(title)
+def _drop_reader(home: Path, stack) -> None:
+    with _db_lock:
+        if (_readers.get(str(home)) or (None, None))[1] is stack:
+            del _readers[str(home)]
+    with contextlib.suppress(Exception):
+        stack.close()
+
+
+def _read(home: Path, fn):
+    """`fn(sessions)` on the store of the profile whose home is `home`. Runs off the event loop. The read-only handle
+    is kept between calls; one that fails is closed, so the next read opens a fresh one."""
+    if not _storage_interface():
+        return fn(_LegacySessions(_session_db()))
+    with _db_lock:
+        held = _readers.get(str(home))
+    if held is None:
+        opened = _open_reader(home)
+        with _db_lock:
+            held = _readers.setdefault(str(home), opened)
+        if held is not opened:  # another thread opened one first
+            with contextlib.suppress(Exception):
+                opened[1].close()
+    try:
+        return fn(_StoreSessions(held[0]))
+    except RequestError:
+        raise
+    except Exception:
+        _drop_reader(home, held[1])
+        raise
+
+
+async def _reading(fn):
+    """`_read` for the profile in scope, off the event loop."""
+    return await asyncio.to_thread(_read, _store_home(), fn)
 
 
 def _config() -> dict[str, Any]:
@@ -335,13 +476,8 @@ async def current_session(runner, source) -> dict[str, Any]:
 async def status(runner, source, busy: bool, queued: int = 0) -> dict[str, Any]:
     """`queued` is the adapter's count of messages waiting behind the current turn."""
     cur = await current_session(runner, source)
-    db = _session_db()
-    row = await asyncio.to_thread(db.get_session, cur["id"]) or {}
+    row = await _reading(lambda s: s.get_session(cur["id"])) or {}
     title = row.get("title")
-    get_title = getattr(db, "get_session_title", None)  # gone in Hermes 0.23.3; the row carries the title
-    if get_title is not None:
-        with contextlib.suppress(Exception):
-            title = await asyncio.to_thread(get_title, cur["id"])
     model = await _live_model(runner, cur["key"]) or row.get("model") or ""
     return {
         "session": {
@@ -387,9 +523,8 @@ async def sessions_list(runner, source, offset: int, limit: int, q: str | None) 
     cur = await current_session(runner, source)
     search = (q or "").strip() or None
     # This chat's lane only (session_key), unnamed sessions included, newest activity first when searching.
-    rows = await asyncio.to_thread(
-        _session_db().list_sessions_rich, source=source.platform.value, session_key=cur["key"],
-        search_query=search, order_by_last_active=bool(search), limit=limit, offset=offset)
+    rows = await _reading(lambda s: s.list_sessions(source=source.platform.value, session_key=cur["key"],
+                                                    search=search, limit=limit, offset=offset))
     items = []
     for r in rows:
         items.append({
@@ -409,13 +544,13 @@ def _visible(row: dict | None, key: str) -> bool:
 async def session_messages(runner, source, sid: str, limit: int, before: int | None) -> list[dict]:
     from .h3proto.richtext import markdown_to_rich
     cur = await current_session(runner, source)
-    db = _session_db()
-    row = await asyncio.to_thread(db.get_session, sid)
-    if not _visible(row, cur["key"]):
-        raise RequestError("not_found", "no such session for this device")
-    resolved = await asyncio.to_thread(_resume_target, db, _store_home(), sid)
-    msgs = await asyncio.to_thread(db.get_messages, resolved or sid, latest=True, include_ancestors=True,
-                                   limit=500)
+
+    def read(s) -> list[dict]:
+        if not _visible(s.get_session(sid), cur["key"]):
+            raise RequestError("not_found", "no such session for this device")
+        return s.messages(s.resume_target(sid) or sid)
+
+    msgs = await _reading(read)
     if before is not None:
         msgs = [m for m in msgs if (m.get("id") or 0) < before]
     msgs = msgs[-limit:]
@@ -440,17 +575,10 @@ async def session_messages(runner, source, sid: str, limit: int, before: int | N
     return items
 
 
-def _writer_path() -> Path | None:
-    """Where the profile in scope keeps its sessions (None = the main agent's default). Read on the event loop:
-    a bot's `profile_scope` is what picks it."""
-    from hermes_constants import get_hermes_home_override
-    override = get_hermes_home_override()
-    return Path(override) / "state.db" if override else None
-
-
 def _open_writer(path: Path | None):
-    """A writable `SessionDB` of the plugin's own. Hermes' registry lends the one writer this process keeps per
-    database (two writers on one file can race each other's checkpoints); a Hermes without it gets a plain one."""
+    """Hermes before 0.23.3: a writable `SessionDB` of the plugin's own. Hermes' registry lends the one writer this
+    process keeps per database (two writers on one file can race each other's checkpoints); a Hermes without it
+    gets a plain one."""
     try:
         from hermes_state_registry import acquire
     except ImportError:
@@ -460,22 +588,35 @@ def _open_writer(path: Path | None):
 
 
 @contextlib.contextmanager
-def _session_writer(path: Path | None):
-    """The writer for one change, handed back afterwards (`close()` on a lent one only returns it). The plugin's
-    lasting handle stays read-only."""
-    db = _open_writer(path)
+def _writing(home: Path, main: bool):
+    """The sessions of the profile whose home is `home`, writable for one change and handed back afterwards. The
+    storage interface gives a handle on the store this process shares (the gateway's own writer); closing it only
+    gives the handle back. The plugin's lasting handle stays read-only. `main` says the home is the main agent's."""
+    if _storage_interface():
+        from persistence_assembly import open_persistence, profile_scope
+        handle = open_persistence(profile_scope(home=home))
+        sessions = _StoreSessions(handle)
+    else:
+        handle = _open_writer(None if main else home / "state.db")
+        sessions = _LegacySessions(handle)
     try:
-        yield db
+        yield sessions
     finally:
         with contextlib.suppress(Exception):
-            db.close()
+            handle.close()
+
+
+def _scope() -> tuple[Path, bool]:
+    """`(home, main)` of the profile in scope, for `_writing`. Read on the event loop."""
+    from hermes_constants import get_hermes_home_override
+    return _store_home(), not get_hermes_home_override()
 
 
 async def _own_session(runner, source, sid: Any) -> tuple[str, dict[str, Any]]:
     """`(sid, current)` for a session of this chat's lane; anything else is `not_found`."""
     sid = str(sid or "").strip()
     cur = await current_session(runner, source)
-    row = await asyncio.to_thread(_session_db().get_session, sid) if sid else None
+    row = await _reading(lambda s: s.get_session(sid)) if sid else None
     if not _visible(row, cur["key"]):
         raise RequestError("not_found", "No such session. Refresh the list.")
     return sid, cur
@@ -489,20 +630,25 @@ async def sessions_rename(runner, source, sid: Any, title: Any) -> dict:
     if not isinstance(title, str):
         raise RequestError("bad_request", "a session needs a name")
 
-    def write(path: Path | None) -> tuple[str, bool]:
-        with _session_writer(path) as db:
-            clean = _clean_title(db, title)
+    def write(home: Path, main: bool) -> tuple[str, bool]:
+        with _writing(home, main) as sessions:
+            clean = sessions.clean_title(title)
             if not clean:
                 raise RequestError("bad_request", "The name is empty.")
-            return clean, db.set_session_title(sid, clean)
+            return clean, sessions.set_title(sid, clean)
 
     try:
-        clean, found = await asyncio.to_thread(write, _writer_path())
+        clean, found = await asyncio.to_thread(write, *_scope())
     except ValueError as exc:  # too long, taken by another session, a bot's own chat
         raise RequestError("bad_request", _clip(str(exc), 200)) from exc
     if not found:
         raise RequestError("not_found", "No such session. Refresh the list.")
     return {"sid": sid, "title": _clip(clean, 80)}
+
+
+# A session a turn is writing to: `SessionActiveWriteGuardError` in `hermes_state`, `SessionWriteGuarded` in the
+# storage interface.
+_BUSY = frozenset({"SessionActiveWriteGuardError", "SessionWriteGuarded"})
 
 
 @_guard
@@ -512,34 +658,26 @@ async def sessions_delete(runner, source, sid: Any) -> dict:
     Never the session the chat is in."""
     from hermes_constants import get_hermes_home
     sid, cur = await _own_session(runner, source, sid)
-    ro = _session_db()
-    home = _store_home()
-    tip = await asyncio.to_thread(_resume_target, ro, home, sid)
-    cur_tip = await asyncio.to_thread(_resume_target, ro, home, cur["id"])
+    tip, cur_tip = await _reading(lambda s: (s.resume_target(sid), s.resume_target(cur["id"])))
     if sid == cur["id"] or (tip or sid) == (cur_tip or cur["id"]):
         raise RequestError("bad_request", "You are in this session. Start or open another one first.")
     sessions_dir = Path(get_hermes_home()) / "sessions"
 
-    def write(path: Path | None) -> bool:
-        with _session_writer(path) as db:
-            # Newer Hermes: refuse while a turn is writing to it, and take the compressed copies of the chat with it.
-            accepted = inspect.signature(db.delete_session).parameters
-            kwargs = {k: v for k, v in (("sessions_dir", sessions_dir), ("exclude_active_write_guards", True),
-                                        ("include_compression_chain", True)) if k in accepted}
-            if not db.delete_session(sid, **kwargs):
+    def write(home: Path, main: bool) -> bool:
+        with _writing(home, main) as sessions:
+            if not sessions.delete(sid, sessions_dir):
                 return False
             with contextlib.suppress(Exception):
                 store.remove_by_session_id(sid)
             with contextlib.suppress(Exception):
-                from gateway.session_ingress_media import collect_unheld_api_images
-                collect_unheld_api_images(db)
+                sessions.collect_images()
             return True
 
     store = getattr(runner, "session_store", None)
     try:
-        deleted = await asyncio.to_thread(write, _writer_path())
+        deleted = await asyncio.to_thread(write, *_scope())
     except RuntimeError as exc:
-        if type(exc).__name__ != "SessionActiveWriteGuardError":
+        if not _BUSY.intersection(c.__name__ for c in type(exc).__mro__):
             raise
         raise RequestError("unavailable", "Hermes is working in this session. Try again when it is done.") from exc
     if not deleted:

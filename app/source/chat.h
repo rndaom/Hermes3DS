@@ -31,6 +31,7 @@ typedef struct {
     uint32_t shown;
     float shown_f;
     time_t local_time;  // 3DS clock when it arrived; 0 for history
+    u64 born;           // osGetTime when it appeared live (it slides in); 0 for history
     uint32_t req_id;    // user messages: id of the `send` request
     bool pending;       // user messages: not acknowledged yet
     bool failed;        // user messages: the upload or send didn't go through

@@ -61,6 +61,54 @@ class _Ctx:
         return registry.dispatch(tool_name, args, **kw)
 
 
+class _SeedDB:
+    """The test's own hand on Hermes' sessions, to set a scene and to look at the result: the storage interface
+    where Hermes has it (0.23.3 and later), `hermes_state` on a Hermes from before it."""
+
+    def __init__(self):
+        try:
+            from persistence_assembly import open_persistence, profile_scope
+        except ImportError:
+            from hermes_state_registry import acquire
+            self.store, self.db = None, acquire()
+        else:
+            self.store, self.db = open_persistence(profile_scope()), None
+
+    def create_session(self, sid, source, **kw):
+        if self.db is not None:
+            return self.db.create_session(sid, source, **kw)
+        from persistence.conversation.sessions import NewSession
+        return self.store.sessions.create(NewSession(session_id=sid, source=source, **kw))
+
+    def append_message(self, sid, role, content):
+        if self.db is not None:
+            return self.db.append_message(sid, role=role, content=content)
+        from persistence.conversation.messages import NewMessage
+        return self.store.messages.append(sid, NewMessage(role=role, content=content))
+
+    def end_session(self, sid, reason):
+        return self.db.end_session(sid, reason) if self.db is not None else self.store.sessions.end(sid, reason)
+
+    def set_session_title(self, sid, title):
+        if self.db is not None:
+            return self.db.set_session_title(sid, title)
+        return self.store.sessions.set_title(sid, title)
+
+    def get_session(self, sid):
+        if self.db is not None:
+            return self.db.get_session(sid)
+        record = self.store.sessions.get(sid)
+        return None if record is None else record.as_session_row()
+
+    def get_messages(self, sid):
+        if self.db is not None:
+            return self.db.get_messages(sid)
+        return [row.as_wire_row() for row in self.store.messages.read_transcript(sid)]
+
+    def close(self):
+        (self.db if self.db is not None else self.store).close()
+
+
 async def main() -> int:
     tmp = Path(tempfile.mkdtemp(prefix="h3ds-it-"))
     atexit.register(shutil.rmtree, tmp, True)
@@ -279,11 +327,18 @@ async def main() -> int:
         from gateway.config import GatewayConfig
         from gateway.session import AsyncSessionStore, SessionStore
         from hermes_constants import get_hermes_home
-        from hermes_state_registry import acquire
-        db = acquire()  # the gateway's writer; the plugin borrows the same one for each change, never the runner's
+        db = _SeedDB()  # the gateway's writer; the plugin takes a handle of its own for each change
         store = SessionStore(Path(get_hermes_home()) / "sessions", GatewayConfig())
         ad.gateway_runner = types.SimpleNamespace(session_store=store, async_session_store=AsyncSessionStore(store))
         check("the welcome says sessions can be changed", c.welcome.get("sessions") == {"edit": True}, str(c.welcome))
+        # Where Hermes has the storage interface the plugin must not touch `hermes_state`, which Hermes 0.27 drops.
+        import plugin.compat as compat_mod
+        legacy_used: list[str] = []
+        if compat_mod._storage_interface():
+            def legacy(*a, **k):
+                legacy_used.append("hermes_state")
+                raise RuntimeError("hermes_state used where the storage interface exists")
+            compat_mod._session_db = compat_mod._open_writer = legacy
         me = srv.devices.get(device_key.public)
         entry = store.get_or_create_session(ad.source_for(me, None))
         key, now_id = entry.session_key, entry.session_id
@@ -344,6 +399,11 @@ async def main() -> int:
               and "it-old" not in ids and {now_id, "it-other"} <= ids, f"{r} {ids}")
         check("the chat is still in its own session", store.get_or_create_session(
             ad.source_for(me, None)).session_id == now_id)
+        found = [i["title"] for i in (await c.request("sessions.list", q="Taxes"))["items"]]
+        check("a search of the sessions finds one by its name", found == ["Taxes"], str(found))
+        check("sessions go through the storage interface where Hermes has it"
+              if compat_mod._storage_interface() else "sessions go through hermes_state on a Hermes without the "
+              "storage interface", not legacy_used, str(legacy_used))
         db.close()
     except Exception as exc:
         import traceback

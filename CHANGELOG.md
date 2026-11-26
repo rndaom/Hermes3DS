@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.3.3 (2026-11-26)
+
+App and plugin. The app gets 3D depth and a little motion; the plugin is ready for Hermes 0.27,
+which removes the old session modules (checked up to Hermes 0.23.4 and its main branch).
+
+App: 3D depth on the chat screen and a little motion. With the 3D slider down the app looks as it did.
+
+- **3D depth** (the chat's top screen, with the 3D slider up): the transcript sits behind the screen, your
+  bubbles, file cards and pictures a little above it, the header, status line and footer on the screen, and an
+  approval card in front of it. A question still waiting for you sits nearer than the rest of the transcript.
+  The other screens are flat for now.
+- **Motion:** a new message slides up and fades in; the approval card rises into place (and, in 3D, comes
+  towards you); a touched button shrinks and springs back. Each takes about a fifth of a second.
+
+Plugin:
+
+- **Sessions through Hermes' storage interface:** on Hermes 0.23.3 and later the plugin now reads, renames and
+  deletes sessions through Hermes' new session storage interface only. It no longer touches the old
+  `hermes_state` modules there, which Hermes will remove in 0.27. Older Hermes is served the old way, as before
+  (checked on 0.22.5, 0.23.2, 0.23.3 and Hermes' main branch). Nothing changes on the 3DS.
+- **Hermes' version in the welcome:** the plugin told the app Hermes was version "0.0.0" on a Hermes installed
+  from source. It now gives the real version on Hermes 0.23.3 and later, and leaves it out when it can't tell.
+
 ## 0.3.2 (2026-11-20)
 
 A plugin fix for Hermes 0.23.3 and later. The app is the same as 0.3.1 apart from its version number; either one

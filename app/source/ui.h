@@ -30,6 +30,17 @@ extern const TextColors BODY_COLORS, USER_COLORS, DIM_COLORS;
 
 void ui_init(void);
 
+// Stereo 3D on the top screen. ui_eye says which eye's picture is being drawn (-1 left, +1 right, 0 for the
+// bottom screen) and where the 3D slider is; ui_depth then puts what is drawn next on a layer (motion.h's
+// DEPTH_*: px behind the screen, negative in front). With the slider down nothing moves.
+void ui_eye(int eye, float slider);
+void ui_depth(float depth);
+// Blend what is drawn next towards `bg` by `amount` (0 = as drawn, 1 = all bg): a fade-in over a plain
+// background. ui_fade(0, 0) ends it.
+void ui_fade(u32 bg, float amount);
+// The button's rectangle as it should be drawn now: a little smaller just after a touch landed on it.
+Rect ui_pressed(const Rect *r);
+
 void rect(float x, float y, float w, float h, u32 c);
 void disc(float cx, float cy, float r, u32 c);  // filled circle
 void frame_rect(float x, float y, float w, float h, u32 c);
@@ -43,7 +54,7 @@ float spaced(const char *s, float x, float y, float scale, u32 color, float spac
 float spaced_width(const char *s, float scale, float spacing);
 float spaced_fit(const char *s, float x, float y, float scale, u32 color, float spacing, float max_w);  // "..." past max_w
 float hint(const char *glyph, const char *label, float x, float y, u32 color);  // returns the advance
-void button(const Rect *r, const char *label, const char *glyph, u32 bg, u32 fg);
+void button(const Rect *r, const char *label, const char *glyph, u32 bg, u32 fg);  // shrinks when just touched
 
 // Times: `t` is a Unix time; the 3DS clock holds local time, so app.tz_off converts.
 void clock_text(time_t local, char *out, size_t cap);  // "9:41 PM" from a local (3DS clock) time

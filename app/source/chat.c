@@ -94,6 +94,7 @@ static Msg *msg_new(Role role)
     m->final = true;
     m->dirty = true;
     m->local_time = time(NULL);
+    m->born = osGetTime();
     set_text(m, "", 0);
     return m;
 }
@@ -467,6 +468,7 @@ void chat_load_history(Chat *c, json_t *items, long tz_off)
         reveal_all(m);
         double ts = json_number_value(json_object_get(it, "ts"));
         m->local_time = ts > 0 ? (time_t)ts + tz_off : 0;
+        m->born = 0;  // history is simply there
         hist[nh++] = m;
     }
     // Keep the newest messages if the history would overflow.

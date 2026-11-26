@@ -1224,7 +1224,16 @@ class _Backend:
 
 
 def _hermes_version() -> str:
+    """Hermes' version, for the welcome. Hermes 0.23.3 and later say it through `hermes_user_agent`; a source
+    install's package metadata says 0.0.0, which is left out."""
+    with contextlib.suppress(Exception):
+        from hermes_cli.version_info import hermes_user_agent
+        shown = hermes_user_agent("hermes3ds").partition("/")[2].strip()
+        if shown:
+            return shown
     with contextlib.suppress(Exception):
         from importlib.metadata import version
-        return version("hermes-agent")
+        found = version("hermes-agent")
+        return "" if found == "0.0.0" else found
+    return "" if found == "0.0.0" else found
     return ""

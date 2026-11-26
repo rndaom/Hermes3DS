@@ -1,5 +1,7 @@
 // Chat and pairing screens, following design/mockups (Chat, Connect); the other tabs are in tabs.c.
 // The header/footer bands are drawn after the transcript so they cover its overflow.
+// With the 3D slider up the chat is in layers (motion.h's DEPTH_*): the transcript behind the screen, its
+// bubbles and cards a little above it, the bands on the screen, the approval card in front.
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
@@ -12,6 +14,7 @@
 #include "codec.h"
 #include "filepick.h"
 #include "image.h"
+#include "motion.h"
 #include "tabs.h"
 #include "text.h"
 #include "ui.h"
@@ -19,6 +22,8 @@
 #include "viewer.h"
 #include "voice.h"
 
+#define MSG_SLIDE 8    // px a new message rises as it fades in
+#define CARD_SLIDE 22  // px the approval card rises as it comes in
 #define USER_MAX_W 262
 #define USER_ATT_W 220  // the user's photo / voice cards, right-aligned
 #define TEXT_X 33   // assistant text column (after the 15 px badge + gap)
@@ -256,12 +261,14 @@ static void draw_message(int i, const Block *b, float y, float top, float bottom
         float ew = text_width(eyebrow, strlen(eyebrow), S_EYE) + strlen(eyebrow) * 0.8f;
         spaced(eyebrow, TOP_W - PAD_X - ew, y, S_EYE, m->failed ? COL_BAD : COL_TX_3, 0.8f);
         float ay = y + b->head_h;
+        ui_depth(DEPTH_FLOAT);
         if (m->len) {
             rect(bx, ay, bw, m->tl.height + 11, COL_BLUE);
             draw_lines(m, bx + 7, ay + 5, b->scale, &USER_COLORS, top, bottom);
             ay += m->tl.height + 11;
         }
         if (m->attach) draw_attachments(m, TOP_W - PAD_X - USER_ATT_W, ay, USER_ATT_W, top, bottom);
+        ui_depth(DEPTH_PAGE);
         break;
     }
     case R_ASSISTANT:
@@ -301,19 +308,29 @@ static void draw_message(int i, const Block *b, float y, float top, float bottom
         } else {
             if (m->len) draw_lines(m, b->x, ty, b->scale, &BODY_COLORS, top, bottom);
             if (!m->final || m->shown < m->len) draw_caret(m, b->x, ty, b->scale);
-            if (m->attach) draw_attachments(m, b->x, ty + (m->len ? visible_height(m) : 0), b->w, top, bottom);
+            if (m->attach) {
+                ui_depth(DEPTH_FLOAT);
+                draw_attachments(m, b->x, ty + (m->len ? visible_height(m) : 0), b->w, top, bottom);
+                ui_depth(DEPTH_PAGE);
+            }
         }
         break;
     }
     case R_SYSTEM:
         draw_lines(m, b->x, y, b->scale, &DIM_COLORS, top, bottom);
-        if (m->attach) draw_attachments(m, b->x, y + (m->len ? visible_height(m) : 0), b->w, top, bottom);
+        if (m->attach) {
+            ui_depth(DEPTH_FLOAT);
+            draw_attachments(m, b->x, y + (m->len ? visible_height(m) : 0), b->w, top, bottom);
+            ui_depth(DEPTH_PAGE);
+        }
         break;
     case R_PROMPT: {
         float h = m->tl.height + 12;
+        if (!m->resolved) ui_depth(DEPTH_FRONT);  // still waiting for you: nearer than the rest of the page
         rect(PAD_X, y, TOP_W - PAD_X * 2, h, m->resolved ? COL_PAPER_2 : COL_ACCENT);
         rect(PAD_X, y, 5, h, COL_INK);
         draw_lines(m, b->x, y + 6, b->scale, &BODY_COLORS, top, bottom);
+        ui_depth(DEPTH_PAGE);
         break;
     }
     }
@@ -464,11 +481,23 @@ static void draw_chat_top(void)
     float max = total - app.view_h;
     if (app.scroll > max) app.scroll = max > 0 ? max : 0;
 
+    u64 now = osGetTime();
+    ui_depth(DEPTH_PAGE);
     float y = top + 8 - (total > app.view_h ? total - app.view_h - app.scroll : 0);
     for (int i = 0; i < app.chat->n; i++) {
         const Block *b = &blocks[i];
-        float h = b->gap + b->head_h + app.chat->m[i]->h;  // as measured in the layout pass
-        if (y + h >= top && y <= bottom) draw_message(i, b, y + b->gap, top, bottom);
+        const Msg *m = app.chat->m[i];
+        float h = b->gap + b->head_h + m->h;  // as measured in the layout pass
+        if (y + h >= top && y <= bottom) {
+            // A message that just appeared slides up into place and fades in.
+            float in = motion_ease_out(motion_progress(now, m->born, MOTION_MSG_MS));
+            if (in < 1) {
+                app_motion(m->born + MOTION_MSG_MS);
+                ui_fade(COL_PAPER, 1 - in);
+            }
+            draw_message(i, b, y + b->gap + floorf((1 - in) * MSG_SLIDE), top, bottom);
+            if (in < 1) ui_fade(0, 0);
+        }
         y += h;
     }
     if (app.chat->n == 0) {
@@ -490,9 +519,15 @@ static void draw_chat_top(void)
     snprintf(title, sizeof title, "%s",
              app.chat->title[0] ? app.chat->title
              : app.cur || !app.server.name[0] ? agent_title(app_agent()) : app.server.name);
+    ui_depth(DEPTH_FRONT);
     if (card) {
+        // The card rises into place and, in 3D, comes forward from the page to in front of the screen.
+        float in = motion_ease_out(motion_progress(now, app.chat->prompt_since, MOTION_CARD_MS));
+        if (in < 1) app_motion(app.chat->prompt_since + MOTION_CARD_MS);
         rect(0, bottom, TOP_W, SCR_H - bottom, COL_PAPER);
-        draw_approval_card(bottom + 2);
+        ui_depth(DEPTH_PAGE + (DEPTH_CARD - DEPTH_PAGE) * in);
+        draw_approval_card(bottom + 2 + floorf((1 - in) * CARD_SLIDE));
+        ui_depth(DEPTH_FRONT);
     }
     draw_header(title);
     if (status) draw_status_line(bottom);
@@ -622,8 +657,9 @@ static void draw_approval_bottom(const BottomLayout *l)
     text_draw(buf, BOT_W - 12 - w, 33, S_TOOL, COL_TX_3);
     text_draw("Run this command?", 11, 45, S_BIG * 0.7f, COL_INK);
     for (int i = 0; i < APPR_N; i++) {
-        const Rect *r = &l->appr[i];
-        if (r->w <= 0) continue;
+        if (l->appr[i].w <= 0) continue;
+        Rect now = ui_pressed(&l->appr[i]);
+        const Rect *r = &now;
         bool primary = i == APPR_ONCE, deny = i == APPR_DENY;
         u32 bg = primary ? COL_BLUE : COL_PAPER, fg = primary ? COL_ON : deny ? COL_BAD : COL_INK;
         u32 fg2 = primary ? COL_ON_2 : deny ? COL_BAD : COL_TX_3;
@@ -660,7 +696,8 @@ static void draw_clarify_bottom(const BottomLayout *l)
         return;
     }
     for (int r = 0; r < l->clar_rows; r++) {
-        const Rect *b = &l->clar[r];
+        Rect now = ui_pressed(&l->clar[r]);
+        const Rect *b = &now;
         int i = l->clar_first + r;
         bool cur = i == app.chat->clar_cur, on = multi && (app.chat->clar_sel >> i & 1);
         u32 fg = cur ? COL_ON : COL_INK;
@@ -736,7 +773,8 @@ static void draw_chat_bottom(void)
     }
 
     // Input bar: paper box, ink border, hard blue shadow.
-    const Rect *in = &l.input;
+    Rect in_now = ui_pressed(&l.input), tk_now = ui_pressed(&l.talk), pt_now = ui_pressed(&l.photo);
+    const Rect *in = &in_now;
     rect(in->x + 2, in->y + 2, in->w, in->h, COL_BLUE);
     rect(in->x, in->y, in->w, in->h, COL_PAPER);
     frame_rect(in->x, in->y, in->w, in->h, COL_INK);
@@ -756,7 +794,7 @@ static void draw_chat_bottom(void)
               in->y + 19, S_TOOL, COL_INK_3);
 
     // Quick tiles: hold to talk, take a photo.
-    const Rect *tk = &l.talk, *pt = &l.photo;
+    const Rect *tk = &tk_now, *pt = &pt_now;
     rect(tk->x + 2, tk->y + 2, tk->w, tk->h, COL_INK);
     rect(tk->x, tk->y, tk->w, tk->h, COL_BLUE);
     float mx = tk->x + 16, my = tk->y + 19;  // a microphone: capsule and stand
@@ -819,7 +857,8 @@ static void draw_chat_bottom(void)
     }
 
     for (int i = 0; i < N_CHIPS; i++) {
-        const Rect *c = &l.chips[i];
+        Rect chip = ui_pressed(&l.chips[i]);
+        const Rect *c = &chip;
         rect(c->x, c->y, c->w, c->h, COL_PAPER);
         frame_rect(c->x, c->y, c->w, c->h, COL_RULE);
         float x = c->x + 6;
@@ -925,23 +964,33 @@ static void draw_pair_bottom(void)
 
 // --- frame ------------------------------------------------------------------
 
-void draw_frame(C3D_RenderTarget *top, C3D_RenderTarget *bottom)
+void draw_frame(C3D_RenderTarget *top, C3D_RenderTarget *top_right, C3D_RenderTarget *bottom)
 {
     text_frame_begin();
     C3D_FrameBegin(C3D_FRAME_SYNCDRAW);
-    C2D_TargetClear(top, COL_PAPER);
-    C2D_SceneBegin(top);
     bool tab = app.screen == SCR_CHAT && app.tab != TAB_CHAT;
     bool files = app.screen == SCR_CHAT && viewer_is_open();
     bool pick = app.screen == SCR_CHAT && filepick_is_open();
     bool cam = app.screen == SCR_CHAT && camera_is_open(), rec = app.screen == SCR_CHAT && voice_recording();
-    if (app.screen == SCR_PAIR) draw_pair_top();
-    else if (rec) voice_draw_top();
-    else if (cam) camera_draw_top();
-    else if (pick) filepick_draw_top();
-    else if (files) viewer_draw_top();
-    else if (tab) tabs_draw_top();
-    else draw_chat_top();
+    // The top screen once per eye: the right eye's picture only while the 3D slider is up (the screen shows
+    // the left one alone otherwise). Only the chat has layers so far; the other screens are flat in both.
+    float slider = top_right ? osGet3DSliderState() : 0;
+    if (slider < 0.02f) slider = 0;
+    for (int e = -1; e <= 1; e += 2) {
+        if (e > 0 && slider <= 0) break;
+        C3D_RenderTarget *t = e < 0 ? top : top_right;
+        C2D_TargetClear(t, COL_PAPER);
+        C2D_SceneBegin(t);
+        ui_eye(e, slider);
+        if (app.screen == SCR_PAIR) draw_pair_top();
+        else if (rec) voice_draw_top();
+        else if (cam) camera_draw_top();
+        else if (pick) filepick_draw_top();
+        else if (files) viewer_draw_top();
+        else if (tab) tabs_draw_top();
+        else draw_chat_top();
+    }
+    ui_eye(0, 0);
     C2D_TargetClear(bottom, COL_PAPER_2);
     C2D_SceneBegin(bottom);
     if (app.screen == SCR_PAIR) draw_pair_bottom();

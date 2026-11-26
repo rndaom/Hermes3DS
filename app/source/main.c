@@ -76,6 +76,7 @@ int main(void)
 {
     perf_start();
     gfxInitDefault();
+    gfxSet3D(true);  // the top screen has a picture per eye (draw.c); with the slider down it is plain 2D
     cfguInit();
     psInit();
     store_init();
@@ -102,6 +103,7 @@ int main(void)
     C2D_Init(8192);
     C2D_Prepare();
     C3D_RenderTarget *top = C2D_CreateScreenTarget(GFX_TOP, GFX_LEFT);
+    C3D_RenderTarget *top_right = C2D_CreateScreenTarget(GFX_TOP, GFX_RIGHT);
     C3D_RenderTarget *bottom = C2D_CreateScreenTarget(GFX_BOTTOM, GFX_LEFT);
     romfsInit();  // emoji sprites (text.c)
     perf_step("gpu");
@@ -122,6 +124,7 @@ int main(void)
     perf_startup_done();
 
     u64 last_draw = 0;
+    int last_slider = -1;
     while (aptMainLoop() && !app.quit) {
         u64 t_events = perf_now();
         app_input();
@@ -148,11 +151,18 @@ int main(void)
         upload_tick();
         app_tick();
         u64 t_draw = perf_now(), t_end = t_draw;
-        bool drew = app.dirty || revealing || (app_animating() && now - last_draw >= ANIM_FRAME_MS);
+        int slider = (int)(osGet3DSliderState() * 32.0f);  // the 3D slider moved: the layers shift
+        if (slider != last_slider) {
+            last_slider = slider;
+            app.dirty = true;
+        }
+        // Motion (a message sliding in, a pressed button) gets every frame until it is over.
+        bool moving = now < app.motion_until;
+        bool drew = app.dirty || revealing || moving || (app_animating() && now - last_draw >= ANIM_FRAME_MS);
         if (drew) {
             app.dirty = false;
             last_draw = now;
-            draw_frame(top, bottom);
+            draw_frame(top, top_right, bottom);
             t_end = perf_now();
         }
         perf_loop(t_ticks - t_events, t_draw - t_ticks, t_end - t_draw, drew, where());

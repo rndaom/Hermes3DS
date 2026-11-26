@@ -41,13 +41,26 @@ PLUGIN = ROOT / "plugin"
 BASELINE = Path(__file__).with_name("hermes_compat_baseline.json")
 SNAPSHOT = PLUGIN / "h3proto" / "hermes_commands.json"
 REPO = "https://github.com/NousResearch/hermes-agent.git"
-HERMES_TOP = {"gateway", "hermes_cli", "hermes_constants", "hermes_state", "hermes_yaml", "plugins", "agent", "tools",
-              "toolsets"}
+HERMES_TOP = {"gateway", "hermes_cli", "hermes_constants", "hermes_state", "hermes_state_registry", "hermes_yaml",
+              "plugins", "agent", "tools", "toolsets", "persistence", "persistence_assembly", "session_retention"}
 # Reached by attribute, not by import (compat.py: the runner the gateway hands the adapter).
 RUNNER_ATTRS = ("served_profile_names", "reconcile_served_profiles", "async_session_store")
-# Session answers that moved in Hermes 0.23.3 (compat.py `_resume_target`, `_clean_title`): one of each pair is needed.
-EITHER = (("hermes_state.SessionDB.resolve_resume_session_id", "persistence_assembly.open_persistence_reader"),
-          ("hermes_state.SessionDB.sanitize_title", "persistence.conversation.sessions.sanitize_title"))
+# Sessions: compat.py speaks Hermes' storage interface where it exists (0.23.3 and later, `_StoreSessions`) and
+# `hermes_state.SessionDB` on a Hermes from before it (`_LegacySessions`). One whole set is needed. `hermes_state`
+# and `hermes_state_registry` go away in Hermes 0.27, so they are not asked for where the interface is whole.
+STORE_NAMES = (
+    "persistence_assembly.open_persistence", "persistence_assembly.open_persistence_reader",
+    "persistence_assembly.profile_scope", "persistence.conversation.sessions.SessionOrder",
+    "persistence.conversation.sessions.SessionQuery", "persistence.conversation.sessions.SessionWindow",
+    "persistence.conversation.sessions.sanitize_title", "persistence.conversation.messages.TranscriptRead")
+LEGACY_NAMES = tuple(f"hermes_state.SessionDB.{n}" for n in (
+    "get_session", "list_sessions_rich", "get_messages", "resolve_resume_session_id", "sanitize_title",
+    "set_session_title", "delete_session"))
+LEGACY_MODULES = {"hermes_state", "hermes_state_registry"}
+STORE_MODULES = {"persistence", "persistence_assembly", "session_retention"}
+# Names the plugin does without on a Hermes that lacks them (adapter.py `_hermes_version`: the welcome then
+# carries no Hermes version).
+OPTIONAL = {"hermes_cli.version_info.hermes_user_agent"}
 SKIP_COMMANDS = {"start", "topic"}  # as tools/build_commands.py
 
 
@@ -68,11 +81,6 @@ def plugin_imports() -> dict[str, list[str]]:
                     if a.name.split(".")[0] in HERMES_TOP:
                         found.setdefault(a.name, set())
     return {m: sorted(n) for m, n in sorted(found.items())}
-
-
-def sessiondb_calls() -> list[str]:
-    src = (PLUGIN / "compat.py").read_text(encoding="utf-8")
-    return sorted(set(re.findall(r"\b(?:db|_session_db\(\))\.([a-z_]+)\b", src)))
 
 
 # --- the probe: runs in its own process, with one Hermes checkout first on sys.path ------------------
@@ -119,7 +127,11 @@ def probe(hermes: Path) -> dict:
 
     out: dict = {"missing": [], "mismatch": [], "abstract": [], "reads": {}, "names": {}, "commands": [],
                  "python": sys.version.split()[0]}
+    store_whole = all(_has(n) for n in STORE_NAMES)
+    out["sessions"] = "the storage interface" if store_whole else "hermes_state.SessionDB"
     for mod, names in plugin_imports().items():
+        if mod.split(".")[0] in (LEGACY_MODULES if store_whole else STORE_MODULES):
+            continue
         try:
             m = importlib.import_module(mod)
         except Exception as exc:
@@ -130,7 +142,8 @@ def probe(hermes: Path) -> dict:
             continue
         for n in names:
             if not hasattr(m, n):
-                out["missing"].append(f"{mod}.{n}")
+                if f"{mod}.{n}" not in OPTIONAL:
+                    out["missing"].append(f"{mod}.{n}")
                 continue
             o = getattr(m, n)
             # an Enum's own signature differs between Python versions and says nothing about Hermes
@@ -146,17 +159,15 @@ def probe(hermes: Path) -> dict:
     except Exception as exc:
         out["missing"].append(f"gateway.run.GatewayRunner ({type(exc).__name__}: {exc})")
     try:
-        import hermes_state
-        out["missing"] += [f"hermes_state.SessionDB.{n}" for n in sessiondb_calls()
-                           if not hasattr(hermes_state.SessionDB, n)]
-        for pair in EITHER:
-            if not any(_has(dotted) for dotted in pair):
-                out["missing"].append(" or ".join(pair))
+        if not store_whole:
+            gone = [n for n in LEGACY_NAMES if not _has(n)]
+            if gone:  # neither set is whole: say what each lacks
+                out["missing"] += gone + [n for n in STORE_NAMES if not _has(n)]
         from tools.registry import registry
         if not hasattr(registry, "get_available_toolsets"):
             out["missing"].append("tools.registry.registry.get_available_toolsets")
     except Exception as exc:
-        out["missing"].append(f"hermes_state / tools.registry ({type(exc).__name__}: {exc})")
+        out["missing"].append(f"tools.registry ({type(exc).__name__}: {exc})")
 
     try:
         from gateway.platforms.base import BasePlatformAdapter as Base
@@ -281,7 +292,8 @@ def report(label: str, checkout: Path, got: dict, integration: tuple[bool, str],
         for it in items:
             print(f"       {it}")
 
-    line(not got["missing"], f"Hermes names the plugin uses: {len(got['names'])} found"
+    line(not got["missing"], f"Hermes names the plugin uses (sessions through {got.get('sessions', '?')}): "
+         f"{len(got['names'])} found"
          + (f", {len(got['missing'])} missing" if got["missing"] else ""), got["missing"])
     line(not got["mismatch"] and not got["abstract"], "The adapter's methods fit Hermes' base class",
          got["mismatch"] + [f"abstract method not implemented: {a}" for a in got["abstract"]])

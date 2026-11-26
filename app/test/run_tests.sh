@@ -81,3 +81,8 @@ OUT="$TMP/h3ds_test_filelist.exe"
 OUT="$TMP/h3ds_test_version.exe"
 "$CC" -std=c99 -O2 -Wall -Wextra -Werror -D_CRT_SECURE_NO_WARNINGS test_version.c ../source/version.c -o "$OUT"
 "$OUT"
+
+# Animation timing and the 3D layers' per-eye shifts (plain C).
+OUT="$TMP/h3ds_test_motion.exe"
+"$CC" -std=c99 -O2 -Wall -Wextra -Werror -D_CRT_SECURE_NO_WARNINGS test_motion.c ../source/motion.c $LIBM -o "$OUT"
+"$OUT"
