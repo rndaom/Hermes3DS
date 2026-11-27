@@ -419,3 +419,8 @@ def test_the_welcome_gives_hermes_its_real_version(adapter_mod, monkeypatch):  #
     assert adapter_mod._hermes_version() == ""
     monkeypatch.setattr(metadata, "version", lambda name: "0.22.5")
     assert adapter_mod._hermes_version() == "0.22.5"
+    # No package metadata at all (a source checkout run in place): nothing, not a crash.
+    def missing(name):
+        raise metadata.PackageNotFoundError(name)
+    monkeypatch.setattr(metadata, "version", missing)
+    assert adapter_mod._hermes_version() == ""

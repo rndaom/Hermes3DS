@@ -1235,5 +1235,4 @@ def _hermes_version() -> str:
         from importlib.metadata import version
         found = version("hermes-agent")
         return "" if found == "0.0.0" else found
-    return "" if found == "0.0.0" else found
     return ""

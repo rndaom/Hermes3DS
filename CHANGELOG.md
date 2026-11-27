@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.3.4 (2026-11-27)
+
+Plugin fix. The app is 0.3.3 with a new version number.
+
+Plugin:
+
+- **No crash on a Hermes without package metadata:** on a Hermes older than 0.23.3 that was run from a source
+  checkout without being installed, the plugin failed to start while it looked up Hermes' version. It now
+  leaves the version out, as intended.
+
 ## 0.3.3 (2026-11-26)
 
 App and plugin. The app gets 3D depth and a little motion; the plugin is ready for Hermes 0.27,
